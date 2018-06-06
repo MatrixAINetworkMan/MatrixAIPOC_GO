@@ -1,2 +1,2 @@
 language: go
-go_import_path: github.com/MatrixAINetworkMan/MatrixAIPOC_GO
+go_import_path: github.com/ethereum/go-ethereum
