@@ -21,3 +21,12 @@ This is considered as a POC of Matrix in the form of golang implementation based
 4. Package the globallist into block and broadcast both the block and the globallist following successful mining; local globallist will be updated after the block info is synchronized 
 
 
+##### PROGRESS UPDATE
+
+2018.6.27:
+
+- Finalized the plan of block generation and transaction validation
+
+- TCP/UDP related modules as well as interfaces in dev
+
+- Miner module in coding 
