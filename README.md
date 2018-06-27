@@ -23,7 +23,7 @@ This is considered as a POC of Matrix in the form of golang implementation based
 
 ##### PROGRESS UPDATE
 
-2018.6.27:
+2018.6.21:
 
 - Finalized the plan of block generation and transaction validation
 
