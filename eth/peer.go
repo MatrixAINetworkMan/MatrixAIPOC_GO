@@ -1,39 +1,33 @@
-// Copyright 2018 The Matrix Authors
-// This file is part of the Matrix library.
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
 //
-// The Matrix library is free software: you can redistribute it and/or modify
+// The go-ethereum library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The Matrix library is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the Matrix library. If not, see <http://www.gnu.org/licenses/>.
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 package eth
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
 	"sync"
 	"time"
-	"net"
-	"strings"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/election"
 	"gopkg.in/fatih/set.v0"
-	"strconv"
 )
 
 var (
@@ -43,8 +37,24 @@ var (
 )
 
 const (
-	maxKnownTxs      = 32768 // Maximum transactions hashes to keep in the known list (prevent DOS)
-	maxKnownBlocks   = 1024  // Maximum block hashes to keep in the known list (prevent DOS)
+	maxKnownTxs    = 32768 // Maximum transactions hashes to keep in the known list (prevent DOS)
+	maxKnownBlocks = 1024  // Maximum block hashes to keep in the known list (prevent DOS)
+
+	// maxQueuedTxs is the maximum number of transaction lists to queue up before
+	// dropping broadcasts. This is a sensitive number as a transaction list might
+	// contain a single transaction, or thousands.
+	maxQueuedTxs = 128
+
+	// maxQueuedProps is the maximum number of block propagations to queue up before
+	// dropping broadcasts. There's not much point in queueing stale blocks, so a few
+	// that might cover uncles should be enough.
+	maxQueuedProps = 4
+
+	// maxQueuedAnns is the maximum number of block announcements to queue up before
+	// dropping broadcasts. Similarly to block propagations, there's no point to queue
+	// above some healthy uncle limit, so use that.
+	maxQueuedAnns = 4
+
 	handshakeTimeout = 5 * time.Second
 )
 
@@ -54,6 +64,12 @@ type PeerInfo struct {
 	Version    int      `json:"version"`    // Ethereum protocol version negotiated
 	Difficulty *big.Int `json:"difficulty"` // Total difficulty of the peer's blockchain
 	Head       string   `json:"head"`       // SHA3 hash of the peer's best owned block
+}
+
+// propEvent is a block propagation, waiting for its turn in the broadcast queue.
+type propEvent struct {
+	block *types.Block
+	td    *big.Int
 }
 
 type peer struct {
@@ -69,31 +85,62 @@ type peer struct {
 	td   *big.Int
 	lock sync.RWMutex
 
-	knownTxs    *set.Set // Set of transaction hashes known to be known by this peer
-	knownBlocks *set.Set // Set of block hashes known to be known by this peer
+	knownTxs    *set.Set                  // Set of transaction hashes known to be known by this peer
+	knownBlocks *set.Set                  // Set of block hashes known to be known by this peer
+	queuedTxs   chan []*types.Transaction // Queue of transactions to broadcast to the peer
+	queuedProps chan *propEvent           // Queue of blocks to broadcast to the peer
+	queuedAnns  chan *types.Block         // Queue of blocks to announce to the peer
+	term        chan struct{}             // Termination channel to stop the broadcaster
 }
-
-// peerSet represents the collection of active peers currently participating in
-// the Ethereum sub-protocol.
-type peerSet struct {
-	peers  map[string]*peer
-	lock   sync.RWMutex
-	closed bool
-}
-
-//var listnode []ListNodeInfo
 
 func newPeer(version int, p *p2p.Peer, rw p2p.MsgReadWriter) *peer {
-	id := p.ID()
-
 	return &peer{
 		Peer:        p,
 		rw:          rw,
 		version:     version,
-		id:          fmt.Sprintf("%x", id[:8]),
+		id:          fmt.Sprintf("%x", p.ID().Bytes()[:8]),
 		knownTxs:    set.New(),
 		knownBlocks: set.New(),
+		queuedTxs:   make(chan []*types.Transaction, maxQueuedTxs),
+		queuedProps: make(chan *propEvent, maxQueuedProps),
+		queuedAnns:  make(chan *types.Block, maxQueuedAnns),
+		term:        make(chan struct{}),
 	}
+}
+
+// broadcast is a write loop that multiplexes block propagations, announcements
+// and transaction broadcasts into the remote peer. The goal is to have an async
+// writer that does not lock up node internals.
+func (p *peer) broadcast() {
+	for {
+		select {
+		case txs := <-p.queuedTxs:
+			if err := p.SendTransactions(txs); err != nil {
+				return
+			}
+			p.Log().Trace("Broadcast transactions", "count", len(txs))
+
+		case prop := <-p.queuedProps:
+			if err := p.SendNewBlock(prop.block, prop.td); err != nil {
+				return
+			}
+			p.Log().Trace("Propagated block", "number", prop.block.Number(), "hash", prop.block.Hash(), "td", prop.td)
+
+		case block := <-p.queuedAnns:
+			if err := p.SendNewBlockHashes([]common.Hash{block.Hash()}, []uint64{block.NumberU64()}); err != nil {
+				return
+			}
+			p.Log().Trace("Announced block", "number", block.Number(), "hash", block.Hash())
+
+		case <-p.term:
+			return
+		}
+	}
+}
+
+// close signals the broadcast goroutine to terminate.
+func (p *peer) close() {
+	close(p.term)
 }
 
 // Info gathers and returns a collection of metadata known about a peer.
@@ -155,58 +202,16 @@ func (p *peer) SendTransactions(txs types.Transactions) error {
 	return p2p.Send(p.rw, TxMsg, txs)
 }
 
-//add by zheng
-func getLocalIp() string {
-	conn, err := net.Dial("udp", "google.com:80")
-	if err != nil {
-		return err.Error()
-	}
-	defer conn.Close()
-	return strings.Split(conn.LocalAddr().String(), ":")[0]
-}
-
-func GetLocalNodeInfo(nodeinfo *election.ListNodeInfo){
-	myInfo :=  GetMyElectionMsg()
-	nodeinfo.Ip = myInfo.Ip
-	nodeinfo.Upime = myInfo.UpTime
-	nodeinfo.TxHash = myInfo.TxId
-	nodeinfo.MortgageAccount = myInfo.MortgageAccount
-	nodeinfo.NodeId = myInfo.NodeId
-	nodeinfo.AnnonceRate = myInfo.AnnonceRate
-}
-
-func GetMyElectionMsg() types.MyElectionMsg{
-	var myElectionMsg types.MyElectionMsg
-
-	myElectionMsg.Ip = getLocalIp()
-	tmpIp := strings.Split(myElectionMsg.Ip, ".")
-	strip := tmpIp[len(tmpIp)-1]
-	myElectionMsg.TxId,_ = strconv.ParseUint(strip,10,64)
-	myElectionMsg.MortgageAccount = 20000
-	myElectionMsg.UpTime = 1513456677
-	myElectionMsg.NodeId = 1
-	myElectionMsg.AnnonceRate = uint32(10000 - myElectionMsg.TxId)
-
-
-
-	return myElectionMsg
-}
-
-func (p *peer) SendElectionMessage() error {
-	request := make(types.ElectionMessage, 1)
-	request[0] = GetMyElectionMsg()
-
-	//log.Info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!Send ElectionMessage", "Send ElectionMessage", request)
-	return p2p.Send(p.rw, EmMsg, request)
-}
-
-//by zheng
-func IsDefaultBootNode() bool{
-	ip := getLocalIp()
-	if ip == "192.168.3.220" || ip == "192.168.3.222" || ip == "192.168.3.179"{
-		return true
-	}else{
-		return false
+// AsyncSendTransactions queues list of transactions propagation to a remote
+// peer. If the peer's broadcast queue is full, the event is silently dropped.
+func (p *peer) AsyncSendTransactions(txs []*types.Transaction) {
+	select {
+	case p.queuedTxs <- txs:
+		for _, tx := range txs {
+			p.knownTxs.Add(tx.Hash())
+		}
+	default:
+		p.Log().Debug("Dropping transaction propagation", "count", len(txs))
 	}
 }
 
@@ -224,25 +229,33 @@ func (p *peer) SendNewBlockHashes(hashes []common.Hash, numbers []uint64) error 
 	return p2p.Send(p.rw, NewBlockHashesMsg, request)
 }
 
+// AsyncSendNewBlockHash queues the availability of a block for propagation to a
+// remote peer. If the peer's broadcast queue is full, the event is silently
+// dropped.
+func (p *peer) AsyncSendNewBlockHash(block *types.Block) {
+	select {
+	case p.queuedAnns <- block:
+		p.knownBlocks.Add(block.Hash())
+	default:
+		p.Log().Debug("Dropping block announcement", "number", block.NumberU64(), "hash", block.Hash())
+	}
+}
+
 // SendNewBlock propagates an entire block to a remote peer.
 func (p *peer) SendNewBlock(block *types.Block, td *big.Int) error {
 	p.knownBlocks.Add(block.Hash())
-
-	//insert gloable list
-	types.Gemq.Lock.Lock()
-
-	block.Eem = *(new(types.ElectionMessage))
-	block.Eem = append(block.Eem, types.Gemq.Ems...)
-	//	log.Info("******* Send gloabel list", " types.Gemq.Ems", types.Gemq.Ems)
-	//log.Info("*******Send new block", "block", block)
-
-	log.Info("**********SendNewBlock", "len", len(block.Eem))
-	for _, obj := range block.Eem{
-		log.Info("**********SendNewBlock", "gloabel Ip", obj.Ip)
-	}
-
-	types.Gemq.Lock.Unlock()
 	return p2p.Send(p.rw, NewBlockMsg, []interface{}{block, td})
+}
+
+// AsyncSendNewBlock queues an entire block for propagation to a remote peer. If
+// the peer's broadcast queue is full, the event is silently dropped.
+func (p *peer) AsyncSendNewBlock(block *types.Block, td *big.Int) {
+	select {
+	case p.queuedProps <- &propEvent{block: block, td: td}:
+		p.knownBlocks.Add(block.Hash())
+	default:
+		p.Log().Debug("Dropping block propagation", "number", block.NumberU64(), "hash", block.Hash())
+	}
 }
 
 // SendBlockHeaders sends a batch of block headers to the remote peer.
@@ -383,6 +396,14 @@ func (p *peer) String() string {
 	)
 }
 
+// peerSet represents the collection of active peers currently participating in
+// the Ethereum sub-protocol.
+type peerSet struct {
+	peers  map[string]*peer
+	lock   sync.RWMutex
+	closed bool
+}
+
 // newPeerSet creates a new peer set to track the active participants.
 func newPeerSet() *peerSet {
 	return &peerSet{
@@ -390,27 +411,13 @@ func newPeerSet() *peerSet {
 	}
 }
 
-//Int to Byte
-func IntToBytes(n int) []byte {
-	//	tmp := int32(n)
-	bytesBuffer := bytes.NewBuffer([]byte{})
-	binary.Write(bytesBuffer, binary.BigEndian, n)
-	return bytesBuffer.Bytes()
-}
-
-//Byte to Int
-func BytesToInt(b []byte) int {
-	bytesBuffer := bytes.NewBuffer(b)
-	var tmp int32
-	binary.Read(bytesBuffer, binary.BigEndian, &tmp)
-	return int(tmp)
-}
-
 // Register injects a new peer into the working set, or returns an error if the
-// peer is already known.
+// peer is already known. If a new peer it registered, its broadcast loop is also
+// started.
 func (ps *peerSet) Register(p *peer) error {
 	ps.lock.Lock()
 	defer ps.lock.Unlock()
+
 	if ps.closed {
 		return errClosed
 	}
@@ -418,21 +425,8 @@ func (ps *peerSet) Register(p *peer) error {
 		return errAlreadyRegistered
 	}
 	ps.peers[p.id] = p
+	go p.broadcast()
 
-	/*
-		if true {
-			//		var tmpnode ListNodeInfo
-			var tmpstr net.Addr
-			tmpstr = p.LocalAddr()
-			tmpnode.ip = tmpstr.String()
-
-			tmpnode.annonceRate = 1
-			//	var tmpID discover.NodeID
-			//	tmpID = p.ID()
-			//		tmpnode.nodeId = (uint32)(BytesToInt([]tmpID))
-			listnode = append(listnode, tmpnode)
-		}
-	*/
 	return nil
 }
 
@@ -442,10 +436,13 @@ func (ps *peerSet) Unregister(id string) error {
 	ps.lock.Lock()
 	defer ps.lock.Unlock()
 
-	if _, ok := ps.peers[id]; !ok {
+	p, ok := ps.peers[id]
+	if !ok {
 		return errNotRegistered
 	}
 	delete(ps.peers, id)
+	p.close()
+
 	return nil
 }
 
@@ -483,30 +480,6 @@ func (ps *peerSet) PeersWithoutBlock(hash common.Hash) []*peer {
 // PeersWithoutTx retrieves a list of peers that do not have a given transaction
 // in their set of known hashes.
 func (ps *peerSet) PeersWithoutTx(hash common.Hash) []*peer {
-	ps.lock.RLock()
-	defer ps.lock.RUnlock()
-
-	list := make([]*peer, 0, len(ps.peers))
-	for _, p := range ps.peers {
-		if !p.knownTxs.Has(hash) {
-			list = append(list, p)
-		}
-	}
-	return list
-}
-
-func (ps *peerSet) PeersAll() []*peer {
-	ps.lock.RLock()
-	defer ps.lock.RUnlock()
-
-	list := make([]*peer, 0, len(ps.peers))
-	for _, p := range ps.peers {
-		list = append(list, p)
-	}
-	return list
-}
-
-func (ps *peerSet) PeersWithoutEm(hash common.Hash) []*peer {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
 

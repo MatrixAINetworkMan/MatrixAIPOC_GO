@@ -22,14 +22,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math/big"
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 // Msg defines the structure of a p2p message.
@@ -89,22 +88,14 @@ type MsgReadWriter interface {
 	MsgWriter
 }
 
-type newBlockData struct {
-	Block *types.Block
-	TD    *big.Int
-}
-
 // Send writes an RLP-encoded message with the given code.
 // data should encode as an RLP list.
 func Send(w MsgWriter, msgcode uint64, data interface{}) error {
 	size, r, err := rlp.EncodeToReader(data)
 	if err != nil {
+		log.Error("NET: Send EncodeToReader!err", "err", err)
 		return err
 	}
-	//var tmp newBlockData
-	//rlp.Decode(r, tmp)
-	//log.Info("***************************Send Decode Block", "tmp", tmp)
-
 	return w.WriteMsg(Msg{Code: msgcode, Size: uint32(size), Payload: r})
 }
 

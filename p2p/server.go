@@ -33,7 +33,6 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/discv5"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
-	//	"github.com/ethereum/go-ethereum/node"
 )
 
 const (
@@ -52,7 +51,6 @@ const (
 	frameWriteTimeout = 20 * time.Second
 )
 
-var PeerCountNum = 0
 var errServerStopped = errors.New("server stopped")
 
 // Config holds Server options.
@@ -281,9 +279,6 @@ func (srv *Server) PeerCount() int {
 		<-srv.peerOpDone
 	case <-srv.quit:
 	}
-
-	PeerCountNum = count
-	fmt.Println("peercount:",count)
 	return count
 }
 
@@ -384,6 +379,64 @@ func (s *sharedUDPConn) Close() error {
 	return nil
 }
 
+var nodiscover = true
+
+func (srv *Server) OpenDyn() (err error) {
+	nodiscover = false
+
+	var (
+		conn      *net.UDPConn
+		realaddr  *net.UDPAddr
+		unhandled chan discover.ReadPacket
+	)
+
+	srv.NoDiscovery = nodiscover
+	if !srv.NoDiscovery && !srv.DiscoveryV5 {
+		addr, err := net.ResolveUDPAddr("udp", srv.ListenAddr)
+		if err != nil {
+			return err
+		}
+		log.Info("opsyn listenudp", "listenudp", "addr")
+		conn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			return err
+		}
+		realaddr = conn.LocalAddr().(*net.UDPAddr)
+		if srv.NAT != nil {
+			if !realaddr.IP.IsLoopback() {
+				go nat.Map(srv.NAT, srv.quit, "udp", realaddr.Port, realaddr.Port, "ethereum discovery")
+			}
+			// TODO: react to external IP changes over time.
+			if ext, err := srv.NAT.ExternalIP(); err == nil {
+				realaddr = &net.UDPAddr{IP: ext, Port: realaddr.Port}
+			}
+		}
+	}
+
+	// node table
+	if !srv.NoDiscovery {
+		cfg := discover.Config{
+			PrivateKey:   srv.PrivateKey,
+			AnnounceAddr: realaddr,
+			NodeDBPath:   srv.NodeDatabase,
+			NetRestrict:  srv.NetRestrict,
+			Bootnodes:    srv.BootstrapNodes,
+			Unhandled:    unhandled,
+		}
+		log.Info("opsyn listenudp", "listenudp", "listenudp")
+		ntab, err := discover.ListenUDP(conn, cfg)
+		if err != nil {
+			return err
+		}
+		srv.ntab = ntab
+	}
+	dynPeers := srv.maxDialedConns()
+	dial = dynPeers
+	return nil
+}
+
+var dial int
+
 // Start starts running the server.
 // Servers can not be re-used after stopping.
 func (srv *Server) Start() (err error) {
@@ -392,7 +445,6 @@ func (srv *Server) Start() (err error) {
 	if srv.running {
 		return errors.New("server already running")
 	}
-
 	srv.running = true
 	srv.log = srv.Config.Logger
 	if srv.log == nil {
@@ -425,7 +477,7 @@ func (srv *Server) Start() (err error) {
 		realaddr  *net.UDPAddr
 		unhandled chan discover.ReadPacket
 	)
-
+	srv.NoDiscovery = nodiscover
 	if !srv.NoDiscovery || srv.DiscoveryV5 {
 		addr, err := net.ResolveUDPAddr("udp", srv.ListenAddr)
 		if err != nil {
@@ -490,6 +542,7 @@ func (srv *Server) Start() (err error) {
 
 	dynPeers := srv.maxDialedConns()
 	dialer := newDialState(srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict)
+
 	// handshake
 	srv.ourHandshake = &protoHandshake{Version: baseProtocolVersion, Name: srv.Name, ID: discover.PubkeyID(&srv.PrivateKey.PublicKey)}
 	for _, p := range srv.Protocols {
@@ -504,10 +557,12 @@ func (srv *Server) Start() (err error) {
 	if srv.NoDial && srv.ListenAddr == "" {
 		srv.log.Warn("P2P server will be useless, neither dialing nor listening")
 	}
-	//	srv.AddPeer(discover.NewNode(1, "192.168.3.220", 30303, 30303))
+
 	srv.loopWG.Add(1)
+	go receiveudp()
 	go srv.run(dialer)
 	srv.running = true
+	Custsrv = srv
 	return nil
 }
 
@@ -582,7 +637,13 @@ func (srv *Server) run(dialstate dialer) {
 		queuedTasks = append(queuedTasks[:0], startTasks(queuedTasks)...)
 		// Query dialer for new tasks and start as many as possible now.
 		if len(runningTasks) < maxActiveDialTasks {
-			nt := dialstate.newTasks(len(runningTasks)+len(queuedTasks), peers, time.Now())
+			var nt []task
+			if dial != 0 {
+				dialer := newDialState(srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dial, srv.NetRestrict)
+				nt = dialer.newTasks(len(runningTasks)+len(queuedTasks), peers, time.Now())
+			} else {
+				nt = dialstate.newTasks(len(runningTasks)+len(queuedTasks), peers, time.Now())
+			}
 			queuedTasks = append(queuedTasks, startTasks(nt)...)
 		}
 	}
@@ -600,6 +661,7 @@ running:
 			// ephemeral static peer list. Add it to the dialer,
 			// it will keep the node connected.
 			srv.log.Debug("Adding static node", "node", n)
+			log.Info("hyk msg: Adding static node", "node", n)
 			dialstate.addStatic(n)
 		case n := <-srv.removestatic:
 			// This channel is used by RemovePeer to send a
@@ -641,7 +703,6 @@ running:
 			if err == nil {
 				// The handshakes are done and it passed all checks.
 				p := newPeer(c, srv.Protocols)
-
 				// If message events are enabled, pass the peerFeed
 				// to the peer
 				if srv.EnableMsgEvents {

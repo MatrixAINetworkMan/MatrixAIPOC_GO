@@ -1,18 +1,18 @@
-// Copyright 2018 The Matrix Authors
-// This file is part of the Matrix library.
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
 //
-// The Matrix library is free software: you can redistribute it and/or modify
+// The go-ethereum library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The Matrix library is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the Matrix library. If not, see <http://www.gnu.org/licenses/>.
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 package eth
 
@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,18 +40,18 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-
+	"github.com/ethereum/go-ethereum/verify"
 	"github.com/ethereum/go-ethereum/election"
+	"github.com/ethereum/go-ethereum/miner"
 )
 
 const (
 	softResponseLimit = 2 * 1024 * 1024 // Target maximum size of returned blocks, headers or node data.
 	estHeaderRlpSize  = 500             // Approximate size of an RLP encoded block header
 
-	// txChanSize is the size of channel listening to TxPreEvent.
+	// txChanSize is the size of channel listening to NewTxsEvent.
 	// The number is referenced from the size of tx pool.
 	txChanSize = 4096
-	emChanSize = 4096
 )
 
 var (
@@ -85,14 +83,9 @@ type ProtocolManager struct {
 
 	SubProtocols []p2p.Protocol
 
-	eventMux *event.TypeMux
-	txCh     chan core.TxPreEvent
-	txSub    event.Subscription
-
-	//	empool emPool
-	//	emCh   chan core.EmPreEvent
-	emSub event.Subscription
-
+	eventMux      *event.TypeMux
+	txsCh         chan core.NewTxsEvent
+	txsSub        event.Subscription
 	minedBlockSub *event.TypeMuxSubscription
 
 	// channels for fetcher, syncer, txsyncLoop
@@ -104,6 +97,14 @@ type ProtocolManager struct {
 	// wait group is used for graceful shutdowns during downloading
 	// and processing
 	wg sync.WaitGroup
+
+	// add by hyk, for block sync completed notify in booting stage
+	setSyncNodeIDCh  chan discover.NodeID
+	finishedBlkSync  chan struct{}
+	blkSyncCompleted chan struct{}
+
+	//MAN
+	udpHandler UDPHandler
 }
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
@@ -111,17 +112,27 @@ type ProtocolManager struct {
 func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) {
 	// Create the protocol manager with the base fields
 	manager := &ProtocolManager{
-		networkId:   networkId,
-		eventMux:    mux,
-		txpool:      txpool,
-		blockchain:  blockchain,
-		chainconfig: config,
-		peers:       newPeerSet(),
-		newPeerCh:   make(chan *peer),
-		noMorePeers: make(chan struct{}),
-		txsyncCh:    make(chan *txsync),
-		quitSync:    make(chan struct{}),
+		networkId:        networkId,
+		eventMux:         mux,
+		txpool:           txpool,
+		blockchain:       blockchain,
+		chainconfig:      config,
+		peers:            newPeerSet(),
+		newPeerCh:        make(chan *peer),
+		noMorePeers:      make(chan struct{}),
+		txsyncCh:         make(chan *txsync),
+		quitSync:         make(chan struct{}),
+		setSyncNodeIDCh:  make(chan discover.NodeID),
+		finishedBlkSync:  make(chan struct{}),
+		blkSyncCompleted: make(chan struct{}),
+
 	}
+
+	//MAN
+	manager.udpHandler = UDPHandler{txpool: &txpool, broadcastInfoCh:make(chan *miner.BroadcastInfo, 1)}
+	sp2p := p2p.Slove_Cycle{}
+	sp2p.RegisterReceiveUDP(manager.udpHandler.AddUDPMsg, manager.udpHandler)
+
 	// Figure out whether to allow fast sync or not
 	if mode == downloader.FastSync && blockchain.CurrentBlock().NumberU64() > 0 {
 		log.Warn("Blockchain not empty, fast sync disabled")
@@ -211,15 +222,11 @@ func (pm *ProtocolManager) removePeer(id string) {
 }
 
 func (pm *ProtocolManager) Start(maxPeers int) {
-
-	if IsDefaultBootNode(){
-		types.Gemq.Ems = append(types.Gemq.Ems,GetMyElectionMsg())	//added by zhenghe
-	}
-
 	pm.maxPeers = maxPeers
+
 	// broadcast transactions
-	pm.txCh = make(chan core.TxPreEvent, txChanSize)
-	pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh)
+	pm.txsCh = make(chan core.NewTxsEvent, txChanSize)
+	pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh)
 	go pm.txBroadcastLoop()
 
 	// broadcast mined blocks
@@ -229,15 +236,12 @@ func (pm *ProtocolManager) Start(maxPeers int) {
 	// start sync handlers
 	go pm.syncer()
 	go pm.txsyncLoop()
-
-	go pm.emBroadcastLoop()
-	go pm.refreshGlobalList()
 }
 
 func (pm *ProtocolManager) Stop() {
 	log.Info("Stopping Ethereum protocol")
 
-	pm.txSub.Unsubscribe()         // quits txBroadcastLoop
+	pm.txsSub.Unsubscribe()        // quits txBroadcastLoop
 	pm.minedBlockSub.Unsubscribe() // quits blockBroadcastLoop
 
 	// Quit the sync loop.
@@ -291,6 +295,9 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	if err := pm.peers.Register(p); err != nil {
 		p.Log().Error("Ethereum peer registration failed", "err", err)
 		return err
+	} else {
+		// add by hyk, in order to begin sync immediately
+		pm.newPeerCh <- p
 	}
 	defer pm.removePeer(p.id)
 
@@ -351,6 +358,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 
 	// Block header query, collect the requested headers and reply
 	case msg.Code == GetBlockHeadersMsg:
+		log.Info("PM HANDLE MSG: GetBlockHeadersMsg", "peer", p)
 		// Decode the complex header query
 		var query getBlockHeadersData
 		if err := msg.Decode(&query); err != nil {
@@ -434,6 +442,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&headers); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: GetBlockHeadersMsg", "peer", p, "len", len(headers))
+
 		// If no headers were received, but we're expending a DAO fork check, maybe it's that
 		if len(headers) == 0 && p.forkDrop != nil {
 			// Possibly an empty reply to the fork header checks, sanity check TDs
@@ -482,6 +492,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		}
 
 	case msg.Code == GetBlockBodiesMsg:
+		log.Info("PM HANDLE MSG: GetBlockBodiesMsg", "peer", p)
 		// Decode the retrieval message
 		msgStream := rlp.NewStream(msg.Payload, uint64(msg.Size))
 		if _, err := msgStream.List(); err != nil {
@@ -514,10 +525,10 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&request); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: receive BlockBodiesMsg", "peer", p, "len", len(request))
 		// Deliver them all to the downloader for queuing
 		transactions := make([][]*types.Transaction, len(request))
 		uncles := make([][]*types.Header, len(request))
-
 		for i, body := range request {
 			transactions[i] = body.Transactions
 			uncles[i] = body.Uncles
@@ -525,7 +536,6 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		// Filter out any explicitly requested bodies, deliver the rest to the downloader
 		filter := len(transactions) > 0 || len(uncles) > 0
 		if filter {
-			transactions, uncles = pm.fetcher.FilterBodies(p.id, transactions, uncles, time.Now())
 		}
 		if len(transactions) > 0 || len(uncles) > 0 || !filter {
 			err := pm.downloader.DeliverBodies(p.id, transactions, uncles)
@@ -540,6 +550,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if _, err := msgStream.List(); err != nil {
 			return err
 		}
+
+		log.Info("PM HANDLE MSG: GetNodeDataMsg", "peer", p)
 		// Gather state data until the fetch or network limits is reached
 		var (
 			hash  common.Hash
@@ -567,6 +579,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&data); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: receive NodeDataMsg", "peer", p, "len", len(data))
+
 		// Deliver all to the downloader
 		if err := pm.downloader.DeliverNodeData(p.id, data); err != nil {
 			log.Debug("Failed to deliver node state data", "err", err)
@@ -578,6 +592,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if _, err := msgStream.List(); err != nil {
 			return err
 		}
+		log.Info("PM HANDLE MSG: GetReceiptsMsg", "peer", p)
 		// Gather state data until the fetch or network limits is reached
 		var (
 			hash     common.Hash
@@ -614,6 +629,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&receipts); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: receive ReceiptsMsg", "peer", p, "len", len(receipts))
+
 		// Deliver all to the downloader
 		if err := pm.downloader.DeliverReceipts(p.id, receipts); err != nil {
 			log.Debug("Failed to deliver receipts", "err", err)
@@ -624,6 +641,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&announces); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: receive NewBlockHashesMsg", "peer", p, "len", len(announces))
+
 		// Mark the hashes as present at the remote node
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
@@ -642,25 +661,13 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 	case msg.Code == NewBlockMsg:
 		// Retrieve and decode the propagated block
 		var request newBlockData
-		//add by zw
 		if err := msg.Decode(&request); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+		log.Info("PM HANDLE MSG: receive NewBlockMsg", "peer", p, "number", request.Block.Number())
 		request.Block.ReceivedAt = msg.ReceivedAt
 		request.Block.ReceivedFrom = p
-		types.Gemq.Lock.Lock()
 
-		types.Gemq.Ems = *(new(types.ElectionMessage))
-		types.Gemq.Ems = append(types.Gemq.Ems, request.Block.Eem...)
-		//log.Info("*******Received globallist", "request.Block", request.Block)
-		//log.Info("*******Received globallist", "types.Gemq.Ems", types.Gemq.Ems)
-		log.Info("**********Received NewBlock", "len", len(request.Block.Eem))
-		for _, obj := range request.Block.Eem{
-			log.Info("**********Received NewBlock", "global Ip", obj.Ip)
-		}
-
-
-		types.Gemq.Lock.Unlock()
 		// Mark the peer as owning the block and schedule it for import
 		p.MarkBlock(request.Block.Hash())
 		pm.fetcher.Enqueue(p.id, request.Block)
@@ -680,7 +687,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			// scenario should easily be covered by the fetcher.
 			currentBlock := pm.blockchain.CurrentBlock()
 			if trueTD.Cmp(pm.blockchain.GetTd(currentBlock.Hash(), currentBlock.NumberU64())) > 0 {
-				go pm.synchronise(p)
+				go pm.synchronise(p, false)
 			}
 		}
 
@@ -694,6 +701,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&txs); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
+
+		log.Info("eth handler: received txs msg", "len", len(txs))
 		for i, tx := range txs {
 			// Validate and mark the remote transaction
 			if tx == nil {
@@ -703,107 +712,10 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		}
 		pm.txpool.AddRemotes(txs)
 
-		//add by zw
-	case msg.Code == EmMsg:
-		var announces types.ElectionMessage
-		if err := msg.Decode(&announces); err != nil {
-			return errResp(ErrDecode, "msg %v: %v", msg, err)
-		}
-		//log.Info("Received ElectionMessage", "request", announces)
-
-		types.Gemq.Lock.Lock()
-		if announces[0].MortgageAccount > 10000 {
-
-			for index, _ := range types.Gemq.Ems {
-				//if em.Ip == announces[0].Ip {
-				//	break
-				//}
-				if index == len(types.Gemq.Ems)-1 {
-					timeUnix := time.Now().Unix()
-					announces[0].RecElecMsgTime = uint64(timeUnix)
-					types.Gemq.Ems = append(types.Gemq.Ems, announces[0])
-				}
-			}
-			if len(types.Gemq.Ems) == 0 {
-				timeUnix := time.Now().Unix()
-				announces[0].RecElecMsgTime = uint64(timeUnix)
-				types.Gemq.Ems = append(types.Gemq.Ems, announces[0])
-			}
-		}
-		types.Gemq.Lock.Unlock()
-
 	default:
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
 	}
 	return nil
-}
-
-//add by zw
-func timeTransfomer() (timestamp int64, err error) {
-	t := time.Now()
-	tmp := strconv.FormatInt(t.UTC().UnixNano(), 10)
-	tmp = tmp[:10]
-	b, err := strconv.ParseInt(tmp, 10, 64)
-	timestamp = b
-	return timestamp, err
-}
-
-//added by zhenghe
-func SetMasterNode(mn * election.MasterListInfo) {
-	var nodeinfo  election.ListNodeInfo
-	log.Info("SetMasterNodeTest")
-
-	mn.SetMasterNodeNum(0)
-
-	for i:=0; i<len(types.Gemq.Ems); i++{
-		nodeinfo.Ip = types.Gemq.Ems[i].Ip
-		nodeinfo.AnnonceRate = types.Gemq.Ems[i].AnnonceRate
-		nodeinfo.NodeId = types.Gemq.Ems[i].NodeId
-		nodeinfo.MortgageAccount = types.Gemq.Ems[0].MortgageAccount
-		nodeinfo.TxHash = types.Gemq.Ems[i].TxId
-		nodeinfo.Upime = types.Gemq.Ems[i].UpTime
-
-		if sta := mn.AddMasterNodeInfo(&nodeinfo); !sta{
-			log.Error("Too many masternode")
-		}
-	}
-
-}
-
-//added by zhenghe
-func IsStandlone() bool{
-	count := len(types.Gemq.Ems)
-	log.Info("IsStandlone","peerCount",count)
-	if count < 3{
-		return true
-	}else{
-		return  false
-	}
-}
-
-
-func removeDuplicatesAndEmpty(a []string) (ret []string) {
-	alen := len(a)
-	for i := 0; i < alen; i++ {
-		if (i > 0 && a[i-1] == a[i]) || len(a[i]) == 0 {
-			continue
-		}
-		ret = append(ret, a[i])
-	}
-	return
-}
-
-func (pm *ProtocolManager) getSubStr(str, substr string) (string, int) {
-	var str1 string
-	result := strings.Index(str, "S")
-	if result >= 0 {
-		prefix := []byte(str)[0:result]
-		rs := []rune(string(prefix))
-		str1 = string(rs[0:result])
-
-		result = len(rs)
-	}
-	return str1, result
 }
 
 // BroadcastBlock will either propagate a block to a subset of it's peers, or
@@ -825,8 +737,7 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 		// Send the block to a subset of our peers
 		transfer := peers[:int(math.Sqrt(float64(len(peers))))]
 		for _, peer := range transfer {
-
-			peer.SendNewBlock(block, td)
+			peer.AsyncSendNewBlock(block, td)
 		}
 		log.Trace("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 		return
@@ -834,30 +745,29 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 	// Otherwise if the block is indeed in out own chain, announce it
 	if pm.blockchain.HasBlock(hash, block.NumberU64()) {
 		for _, peer := range peers {
-			peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()})
+			peer.AsyncSendNewBlockHash(block)
 		}
 		log.Trace("Announced block", "hash", hash, "recipients", len(peers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 	}
 }
 
-// BroadcastTx will propagate a transaction to all peers which are not known to
+// BroadcastTxs will propagate a batch of transactions to all peers which are not known to
 // already have the given transaction.
-func (pm *ProtocolManager) BroadcastTx(hash common.Hash, tx *types.Transaction) {
-	// Broadcast transaction to a batch of peers not knowing about it
-	peers := pm.peers.PeersWithoutTx(hash)
-	//FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))]
-	for _, peer := range peers {
-		peer.SendTransactions(types.Transactions{tx})
-	}
-	log.Trace("Broadcast transaction", "hash", hash, "recipients", len(peers))
-}
+func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) {
+	var txset = make(map[*peer]types.Transactions)
 
-func (pm *ProtocolManager) broadcastEm() { //(tx *types.Transaction) {
-	peers := pm.peers.PeersAll()
-	for _, peer := range peers {
-		peer.SendElectionMessage()
+	// Broadcast transactions to a batch of peers not knowing about it
+	for _, tx := range txs {
+		peers := pm.peers.PeersWithoutTx(tx.Hash())
+		for _, peer := range peers {
+			txset[peer] = append(txset[peer], tx)
+		}
+		log.Trace("Broadcast transaction", "hash", tx.Hash(), "recipients", len(peers))
 	}
-	//log.Trace("Broadcast ElectionMessage", "hash", "recipients", len(peers))
+	// FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))]
+	for peer, txs := range txset {
+		peer.AsyncSendTransactions(txs)
+	}
 }
 
 // Mined broadcast loop
@@ -866,7 +776,6 @@ func (pm *ProtocolManager) minedBroadcastLoop() {
 	for obj := range pm.minedBlockSub.Chan() {
 		switch ev := obj.Data.(type) {
 		case core.NewMinedBlockEvent:
-			//			log.Info("*******************************minedBroadcastLoop", "new block", ev.Block)
 			pm.BroadcastBlock(ev.Block, true)  // First propagate block to peers
 			pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest
 		}
@@ -876,83 +785,83 @@ func (pm *ProtocolManager) minedBroadcastLoop() {
 func (pm *ProtocolManager) txBroadcastLoop() {
 	for {
 		select {
-		case event := <-pm.txCh:
-			fmt.Println("txBroadcasttxBroadcasttxBroadcasttxBroadcasttxBroadcast")
-			pm.BroadcastTx(event.Tx.Hash(), event.Tx)
+		case event := <-pm.txsCh:
+			pm.BroadcastTxs(event.Txs)
 
 		// Err() channel will be closed when unsubscribing.
-		case <-pm.txSub.Err():
+		case <-pm.txsSub.Err():
 			return
 		}
 	}
 }
 
-
-func (pm *ProtocolManager) refreshGlobalList() {
-
-	tc := time.Tick(time.Second * 20)
-	for {
-		<-tc
-
-		types.Gemq.Lock.Lock()
-		log.Info("***************refreshGlobalList", "GlobalList Length", len(types.Gemq.Ems))
-		log.Info("***************refreshGlobalList", "refreshGlobalList", types.Gemq.Ems)
-
-		len := len(types.Gemq.Ems)
-		if len > 0 {
-			for index, obj := range types.Gemq.Ems {
-				curTime := time.Now().Unix()
-
-				if (uint64(curTime) - obj.RecElecMsgTime) > 20 && obj.Ip != getLocalIp() {
-					if index > 0 {
-						types.Gemq.Ems = append(types.Gemq.Ems[:index-1], types.Gemq.Ems[index:]...)
-					}
-					if index == 0 {
-						if len != 1 {
-							types.Gemq.Ems = types.Gemq.Ems[1:]
-						} else {
-							types.Gemq.Ems = *(new(types.ElectionMessage))
-						}
-					}
-				}
-			}
-		}
-		types.Gemq.Lock.Unlock()
-		continue
-	}
+type UDPHandler struct {
+	txpool          *txPool
+	broadcastInfoCh chan *miner.BroadcastInfo
+	verifier        *verifier.Verifier
 }
 
-/*
-func (pm *ProtocolManager) refreshGlobalList() {
-	var cur int
-	tc := time.Tick(time.Second * 20)
-	for {
-		<-tc
-		types.Gemq.Lock.Lock()
-		log.Info("***************refreshGlobalList", "GlobalList Length", len(types.Gemq.Ems))
-		log.Info("***************refreshGlobalList", "refreshGlobalList", types.Gemq.Ems)
-		cur = 0
-		for _, obj := range types.Gemq.Ems {
+func (pm *UDPHandler) AddVerifier(v *verifier.Verifier) {
+	pm.verifier = v
+}
+func (pm *UDPHandler) AddUDPMsg(b interface{}, data []byte) error {
+	//unmarshal the msg data
+	var verifierMsg verifier.MsgToMiner
+	if err := json.Unmarshal(data, &verifierMsg); err != nil {
+		log.Error("hyk msg: unmarshal upd msg data fail")
+		return errResp(ErrVerify, "unmarshal upd msg data fail")
+	}
+	log.Info("p2p verifier msg: received", "blockNumber", verifierMsg.BlockNum, "type", verifierMsg.MsgType)
 
-			cur++
-			curTime := time.Now().Unix()
-			if uint64(curTime)-obj.RecElecMsgTime > 20 {
-				types.Gemq.Ems = append(types.Gemq.Ems[:cur-1], types.Gemq.Ems[cur:]...)
-			}
+	switch verifierMsg.MsgType {
+	case 1: //1:Transaction
+		var txData verifier.ConsesusResult
+		if err := json.Unmarshal(verifierMsg.Data, &txData); err != nil {
+			log.Error("p2p verifier msg: unmarshal transaction info msg data fail", "blockNumber", verifierMsg.BlockNum, "type", verifierMsg.MsgType)
+			return errResp(ErrVerify, "msg blockNumber[%d] type[%d] unmarshal fail", verifierMsg.BlockNum, verifierMsg.MsgType)
 		}
 
-		types.Gemq.Lock.Unlock()
-	}
-}
-*/
+		if !pm.verifier.DposTx(txData.Result) {
+			log.Error("p2p verifier msg: message from verify is fake", "blockNumber", verifierMsg.BlockNum, "type", verifierMsg.MsgType)
+			return errResp(ErrVerify, "msg blockNumber[%d] type[%d] message from verify is fake", verifierMsg.BlockNum, verifierMsg.MsgType)
+		}
 
-//add by zw
-func (pm *ProtocolManager) emBroadcastLoop() {
-	tc := time.Tick(time.Second * 10)
-	for {
-		<-tc
-		pm.broadcastEm() //(evetnt.Tx)
+		if len(txData.Txs) == 0 {
+			log.Info("p2p verifier msg: tx list is empty, no need to input to tx pool")
+			return nil
+		}
+
+		txs := make([]*types.Transaction, len(txData.Txs))
+		for i := 0; i < len(txData.Txs); i++ {
+			txs[i] = &txData.Txs[i]
+		}
+
+		for i, tx := range txs {
+			// Validate and mark the remote transaction
+			if tx == nil {
+				log.Error("p2p verifier msg: transaction is nil", "index", i)
+				return errResp(ErrDecode, "transaction %d is nil", i)
+			}
+		}
+		log.Info("p2p verifier msg: begin to input tx pool", "txList", txs)
+		if err := (*pm.txpool).AddRemotes(txs); err != nil {
+			log.Error("p2p verifier msg: txs add to tx pool err!", "err", err)
+		}
+
+	case 2:	//2:Broadcast
+		var nodeList election.NodeList
+		if err := json.Unmarshal(verifierMsg.Data, &nodeList); err != nil {
+			log.Error("p2p verifier msg: unmarshal broadcast info msg data fail", "blockNumber", verifierMsg.BlockNum, "type", verifierMsg.MsgType)
+			return errResp(ErrVerify, "msg blockNumber[%d] type[%d] unmarshal fail", verifierMsg.BlockNum, verifierMsg.MsgType)
+		}
+		log.Info("p2p verifier msg: begin to notify broadcast info", "blockNum",  verifierMsg.BlockNum, "nodeList", nodeList)
+		pm.broadcastInfoCh <- &miner.BroadcastInfo{NodeList:nodeList, BlockNum:verifierMsg.BlockNum}
+
+	default:
+		log.Error("p2p verifier msg: verifier msg type err!", "type", verifierMsg.MsgType)
 	}
+
+	return nil
 }
 
 // NodeInfo represents a short summary of the Ethereum sub-protocol metadata

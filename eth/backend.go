@@ -1,18 +1,18 @@
-// Copyright 2018 The Matrix Authors
-// This file is part of the Matrix library.
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
 //
-// The Matrix library is free software: you can redistribute it and/or modify
+// The go-ethereum library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The Matrix library is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the Matrix library. If not, see <http://www.gnu.org/licenses/>.
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 // Package eth implements the Ethereum protocol.
 package eth
@@ -46,11 +46,13 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
-	"github.com/ethereum/go-ethereum/election"
-	"time"
+	"github.com/ethereum/go-ethereum/scheduler"
+	"github.com/ethereum/go-ethereum/verify"
+	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 type LesServer interface {
@@ -87,18 +89,16 @@ type Ethereum struct {
 	APIBackend *EthAPIBackend
 
 	miner     *miner.Miner
+	Scheduler *scheduler.Scheduler
+	Verifier  *verifier.Verifier
 	gasPrice  *big.Int
 	etherbase common.Address
 
 	networkId     uint64
 	netRPCService *ethapi.PublicNetAPI
-
+	apiCmd  *PrivateMinerAPI
 	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 }
-
-var (
-	masterNodeList [2] election.MasterListInfo
-)
 
 func (s *Ethereum) AddLesServer(ls LesServer) {
 	s.lesServer = ls
@@ -107,9 +107,6 @@ func (s *Ethereum) AddLesServer(ls LesServer) {
 
 // New creates a new Ethereum object (including the
 // initialisation of the common Ethereum object)
-func (eth * Ethereum)GetCoinBase()(common.Address){
-	return eth.etherbase
-}
 func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if config.SyncMode == downloader.LightSync {
 		return nil, errors.New("can't run eth.Ethereum in light sync mode, use les.LightEthereum")
@@ -175,7 +172,7 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb); err != nil {
 		return nil, err
 	}
-	eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine)
+	eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine, eth.protocolManager.udpHandler.broadcastInfoCh)
 	eth.miner.SetExtra(makeExtraData(config.ExtraData))
 
 	eth.APIBackend = &EthAPIBackend{eth, nil}
@@ -184,9 +181,10 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 		gpoParams.Default = config.GasPrice
 	}
 	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, gpoParams)
-
-	electionRun(eth)
-
+	//add verifier
+	eth.Verifier = verifier.New(eth.blockchain, eth.txPool)
+	eth.Scheduler = scheduler.New(eth.blockchain, eth.miner, eth.chainConfig, eth.Verifier)
+	eth.protocolManager.udpHandler.AddVerifier(eth.Verifier)
 	return eth, nil
 }
 
@@ -226,14 +224,14 @@ func CreateConsensusEngine(ctx *node.ServiceContext, config *ethash.Config, chai
 		return clique.New(chainConfig.Clique, db)
 	}
 	// Otherwise assume proof-of-work
-	switch {
-	case config.PowMode == ethash.ModeFake:
+	switch config.PowMode {
+	case ethash.ModeFake:
 		log.Warn("Ethash used in fake mode")
 		return ethash.NewFaker()
-	case config.PowMode == ethash.ModeTest:
+	case ethash.ModeTest:
 		log.Warn("Ethash used in test mode")
 		return ethash.NewTester()
-	case config.PowMode == ethash.ModeShared:
+	case ethash.ModeShared:
 		log.Warn("Ethash used in shared mode")
 		return ethash.NewShared()
 	default:
@@ -250,7 +248,7 @@ func CreateConsensusEngine(ctx *node.ServiceContext, config *ethash.Config, chai
 	}
 }
 
-// APIs returns the collection of RPC services the ethereum package offers.
+// APIs return the collection of RPC services the ethereum package offers.
 // NOTE, some of these services probably need to be moved to somewhere else.
 func (s *Ethereum) APIs() []rpc.API {
 	apis := ethapi.GetAPIs(s.APIBackend)
@@ -344,7 +342,6 @@ func (s *Ethereum) SetEtherbase(etherbase common.Address) {
 }
 
 func (s *Ethereum) StartMining(local bool) error {
-
 	eb, err := s.Etherbase()
 	if err != nil {
 		log.Error("Cannot start mining without etherbase", "err", err)
@@ -366,6 +363,64 @@ func (s *Ethereum) StartMining(local bool) error {
 		atomic.StoreUint32(&s.protocolManager.acceptTxs, 1)
 	}
 	go s.miner.Start(eb)
+	return nil
+}
+
+
+type I interface {
+	Get(*int) error
+}
+
+func (s *Ethereum) StartScheduler(N *discover.Node,accountManager *accounts.Manager,rpcClient *ethclient.Client)  error {
+	//eb, err := s.Etherbase()
+	//if err != nil {
+	//	log.Error("Cannot start mining without etherbase", "err", err)
+	//	return fmt.Errorf("etherbase missing: %v", err)
+	//}
+	//if clique, ok := s.engine.(*clique.Clique); ok {
+	//	wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
+	//	if wallet == nil || err != nil {
+	//		log.Error("Etherbase account unavailable locally", "err", err)
+	//		return fmt.Errorf("signer missing: %v", err)
+	//	}
+	//	clique.Authorize(eb, wallet.SignHash)
+	//}
+	//if local {
+	//	// If local (CPU) mining is started, we can disable the transaction rejection
+	//	// mechanism introduced to speed sync times. CPU mining on mainnet is ludicrous
+	//	// so none will ever hit this path, whereas marking sync done on CPU mining
+	//	// will ensure that private networks work in single miner mode too.
+	//	atomic.StoreUint32(&s.protocolManager.acceptTxs, 1)
+	//}
+
+	s.apiCmd = NewPrivateMinerAPI(s)
+
+	go s.Scheduler.Start(N,rpcClient,accountManager,s.Startmining,s.Stopmining)
+	return nil
+}
+
+func (s *Ethereum) Startmining()  {
+	log.Info("Startmining!!!!")
+	//go s.Verifier.Start()
+	threadNum:=runtime.NumCPU()
+	s.apiCmd.Start(&threadNum)
+
+}
+func (s *Ethereum) Stopmining() {
+	type threaded interface {
+		SetThreads(threads int)
+	}
+	if th, ok := s.engine.(threaded); ok {
+		th.SetThreads(-1)
+	}
+	s.StopMining()
+
+}
+
+
+func (s *Ethereum) StartVerifier(local bool) error {
+	log.Warn("Ready to call verifier.Start()!!!!")
+	//go s.Verifier.Start()
 	return nil
 }
 
@@ -437,132 +492,19 @@ func (s *Ethereum) Stop() error {
 	return nil
 }
 
-type Election struct {
-	ElectionNet [2] election.ElectionNetInfo
-	PingPongInd uint8
-	miner       *miner.Miner
+// add by hyk, set sync node id
+func (s *Ethereum) SetSyncNodeID(nodeid discover.NodeID) {
+	s.protocolManager.setSyncNodeIDCh <- nodeid
 }
-const(
-	masterNodeBroadcastPriod = 10
-	masterNodeRefreshPriod   = 5
-	electionNetEffterTime    = 6
-	blockEffectDelay         = 4
-)
-func electionRun( ethinfo * Ethereum) {
 
-	var elector Election
+// add by hyk, waiting for block sync completed
+func (s *Ethereum) WaitingBlkSyncCompleted() error {
+	// TODO add fail handle
+	select {
+	case <-s.protocolManager.blkSyncCompleted:
+		s.protocolManager.finishedBlkSync <- struct {}{}
+		return nil
+	}
 
-	var apiCmd  PrivateMinerAPI
-
-	//Initialize election info
-	elector.ElectionNet[0].MasterList = &masterNodeList[0]
-	elector.ElectionNet[1].MasterList = &masterNodeList[1]
-	elector.PingPongInd = 0
-	elector.ElectionNet[0].Init()
-	elector.ElectionNet[1].Init()
-	elector.miner = ethinfo.miner
-
-
-
-	go func() {
-		var localNodeInfo election.ListNodeInfo
-		for {
-			bh := <-core.ChBlockWriteEvent
-			blockNum := bh.Number.Uint64()
-			log.Info("***ELECTION***Block Chain Ctrl", "Rcv Block Num：", blockNum, "BLOCK DIFFICULT:", bh.Difficulty.Uint64())
-
-			if  IsStandlone(){
-				continue
-			}
-
-			//Block height value used as the time driver to produce the selection process
-			if blockNum%masterNodeBroadcastPriod == blockEffectDelay {
-				block := ethinfo.blockchain.GetBlockByNumber(uint64(blockNum - blockEffectDelay))
-				bufferInd := (elector.PingPongInd + 1) & 1
-				log.Info("Election ", "Election Buff", bufferInd)
-				//Get masternode list
-				masterListInfoPtr := elector.ElectionNet[bufferInd].MasterList
-				SetMasterNode(masterListInfoPtr)
-				masterListInfoPtr.SetPreHash(block.ParentHash().Big().Uint64())
-
-				masterListInfoPtr.PrintNode()
-
-				v := &elector.ElectionNet[bufferInd]
-				v.Election(v.MasterList)
-				log.Info("***ELECTION***Read BroadcastBlock：", "BROADCAST NUM : ", block.Number().Uint64(), "MASTER NODE NUM :", masterListInfoPtr.GetMsaterListLen())
-				log.Info("***ELECTION*** ELC INFO: ", "MASTERNODE NUM : ", masterListInfoPtr.GetMsaterListLen(), "CAL NET REGION NUM : ", elector.ElectionNet[bufferInd].CalcullatorRegionNum, "VER NET REGION NUM :", elector.ElectionNet[bufferInd].VerifierRegionNum)
-				log.Info("********************************Computing Power Network******************************")
-				for i := 0; i < v.CalcullatorRegionNum; i++ {
-					log.Info("|", "============grouping", i, "============")
-					for j := 0; j < v.CalcullatorNet[i].Depth; j++ {
-						log.Info("|", "***********LEVEL", j)
-						node := v.CalcullatorNet[i].GetSpecLevelNode(j)
-						for k := 0; k < len(node); k++ {
-							log.Info("|", "IP:", node[k].GetSelfIP(v), "Parent IP:", node[k].GetParentIP(v, v.CalcullatorNet[i]))
-						}
-					}
-					log.Info("|", "===============", "============")
-				}
-				log.Info("********************************Verification Network******************************")
-				for i := 0; i < v.VerifierRegionNum; i++ {
-					log.Info("|", "============grouping", i, "============")
-					for j := 0; j < v.VerifierNet[i].Depth; j++ {
-						log.Info("|", "***********LEVEL", j)
-						node := v.VerifierNet[i].GetSpecLevelNode(j)
-						for k := 0; k < len(node); k++ {
-							log.Info("|", "IP:", node[k].GetSelfIP(v), "Parent IP:", node[k].GetParentIP(v, v.VerifierNet[i]))
-						}
-					}
-					log.Info("|", "===============", "============")
-				}
-			}
-			if blockNum%masterNodeBroadcastPriod == electionNetEffterTime {
-				log.Info("***ELECTION***Update Net", "Block Num", blockNum)
-				//Start or stop miner based on the election info
-				elector.PingPongInd = (elector.PingPongInd + 1) & 1
-				bufferInd := elector.PingPongInd
-				log.Info("Election ", "Effictive Buff", bufferInd)
-				GetLocalNodeInfo(&localNodeInfo)
-				log.Info("","Local Info", localNodeInfo)
-				if localNodeInfo.IsMinner(&elector.ElectionNet[bufferInd]) {
-					//ethinfo.miner.Start(ethinfo.GetCoinBase())
-					log.Info("Miner Start Because of Cal Net ")
-					if false == ethinfo.miner.Mining(){
-						apiCmd.e = ethinfo;
-						(&apiCmd).Start(nil)
-					}
-				} else {
-					ethinfo.miner.Stop()
-					apiCmd.e = ethinfo;
-					(&apiCmd).Stop()
-					log.Info("Miner Stop Because of Cal Net ")
-				}
-
-
-			}
-		}
-
-	}()
-
-	go func() {
-		futureTimer := time.NewTicker(30 * time.Second)
-		defer futureTimer.Stop()
-		for {
-			select {
-			case <-futureTimer.C:
-				if IsStandlone()  {
-					if (IsDefaultBootNode()) && (false == ethinfo.miner.Mining()){
-						apiCmd.e = ethinfo;
-						(&apiCmd).Start(nil)
-						log.Info("Miner Start Because of standlone and bootnode")
-					}
-					if (!IsDefaultBootNode()) && (true == ethinfo.miner.Mining()){
-							apiCmd.e = ethinfo;
-							(&apiCmd).Stop()
-							log.Info("Miner Stop Because of standlone and none bootnode")
-					}
-				}
-			}
-		}
-	}()
+	return errors.New("block sync err!")
 }

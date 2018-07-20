@@ -26,11 +26,12 @@ import (
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
+	"fmt"
 )
 
 const (
 	forceSyncCycle      = 10 * time.Second // Time interval to force syncs, even if few peers are available
-	minDesiredPeerCount = 5                // Amount of peers desired to start syncing
+	minDesiredPeerCount = 2                // Amount of peers desired to start syncing
 
 	// This is the target size for the packs of transactions sent by txsyncLoop.
 	// A pack can get larger than this if a single transactions exceeds this size.
@@ -137,6 +138,9 @@ func (pm *ProtocolManager) syncer() {
 	defer pm.fetcher.Stop()
 	defer pm.downloader.Terminate()
 
+	//First running start up syncer
+	pm.syncerStartUp()
+
 	// Wait for different events to fire synchronisation operations
 	forceSync := time.NewTicker(forceSyncCycle)
 	defer forceSync.Stop()
@@ -148,11 +152,11 @@ func (pm *ProtocolManager) syncer() {
 			if pm.peers.Len() < minDesiredPeerCount {
 				break
 			}
-			go pm.synchronise(pm.peers.BestPeer())
+			go pm.synchronise(pm.peers.BestPeer(), false)
 
 		case <-forceSync.C:
 			// Force a sync even if not enough peers are present
-			go pm.synchronise(pm.peers.BestPeer())
+			go pm.synchronise(pm.peers.BestPeer(), false)
 
 		case <-pm.noMorePeers:
 			return
@@ -160,18 +164,49 @@ func (pm *ProtocolManager) syncer() {
 	}
 }
 
+//syncer for start up
+func (pm *ProtocolManager) syncerStartUp() {
+	syncNodeID := " "
+
+	for {
+		select {
+		case nodeID := <-pm.setSyncNodeIDCh:
+			syncNodeID = fmt.Sprintf("%x", nodeID.Bytes()[:8])
+			log.Info("PM STARTUP SYN: syncer start up set node id!", "nodeID", syncNodeID)
+			go pm.synchronise(pm.peers.Peer(syncNodeID), true)
+
+		case <-pm.newPeerCh:
+			log.Info("PM STARTUP SYN: syncer start up recv new peer!", "syncNodeID", syncNodeID)
+			go pm.synchronise(pm.peers.Peer(syncNodeID), true)
+
+		case <-pm.finishedBlkSync:
+			log.Info("PM STARTUP SYN: syncer start up finished!")
+			return
+		}
+	}
+}
+
 // synchronise tries to sync up our local block chain with a remote peer.
-func (pm *ProtocolManager) synchronise(peer *peer) {
+func (pm *ProtocolManager) synchronise(peer *peer, needSyncNotify bool) {
 	// Short circuit if no peers are available
 	if peer == nil {
 		return
 	}
+
+	if needSyncNotify {
+		log.Info("PM SYNCHRONISE: block going to sync","peer", peer)
+	}
+
 	// Make sure the peer's TD is higher than our own
 	currentBlock := pm.blockchain.CurrentBlock()
 	td := pm.blockchain.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
 
 	pHead, pTd := peer.Head()
 	if pTd.Cmp(td) <= 0 {
+		if needSyncNotify {
+			log.Info("PM SYNCHRONISE: synchronise pTd.Cmp(td) <= 0, no need sync, notify", "pTd", pTd, "td", td)
+			pm.blkSyncCompleted <- struct{}{}
+		}
 		return
 	}
 	// Otherwise try to sync with the downloader
@@ -198,11 +233,20 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 
 	// Run the sync cycle, and disable fast sync if we've went past the pivot block
 	if err := pm.downloader.Synchronise(peer.id, pHead, pTd, mode); err != nil {
+		log.Info("PM SYNCHRONISE: downloader synchronise err", "err", err)
 		return
 	}
+
+	//add by hyk, block sync completed notify
+	if needSyncNotify {
+		log.Info("PM SYNCHRONISE: block sync finished, go to notify")
+		pm.blkSyncCompleted <- struct{}{}
+	}
+
 	if atomic.LoadUint32(&pm.fastSync) == 1 {
 		log.Info("Fast sync complete, auto disabling")
 		atomic.StoreUint32(&pm.fastSync, 0)
+
 	}
 	atomic.StoreUint32(&pm.acceptTxs, 1) // Mark initial sync done
 	if head := pm.blockchain.CurrentBlock(); head.NumberU64() > 0 {

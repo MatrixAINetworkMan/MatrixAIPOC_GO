@@ -8,10 +8,13 @@ import (
 	"github.com/go-stack/stack"
 )
 
-const timeKey = "t"
+const timeKey = "et"
 const lvlKey = "lvl"
 const msgKey = "msg"
+const ctxKey = "txc"
+const cntkey = "gnt"
 const errorKey = "LOG15_ERROR"
+const skipLevel = 2
 
 type Lvl int
 
@@ -24,7 +27,9 @@ const (
 	LvlTrace
 )
 
-// Aligned returns a 5-character string containing the name of a Lvl.
+var gLogCounter uint
+
+// AlignedString returns a 5-character string containing the name of a Lvl.
 func (l Lvl) AlignedString() string {
 	switch l {
 	case LvlTrace:
@@ -64,7 +69,7 @@ func (l Lvl) String() string {
 	}
 }
 
-// Returns the appropriate Lvl from a string name.
+// LvlFromString returns the appropriate Lvl from a string name.
 // Useful for parsing command line args and configuration files.
 func LvlFromString(lvlString string) (Lvl, error) {
 	switch lvlString {
@@ -90,15 +95,19 @@ type Record struct {
 	Time     time.Time
 	Lvl      Lvl
 	Msg      string
+	Cnt      uint
 	Ctx      []interface{}
 	Call     stack.Call
 	KeyNames RecordKeyNames
 }
 
+// RecordKeyNames gets stored in a Record when the write function is executed.
 type RecordKeyNames struct {
 	Time string
 	Msg  string
 	Lvl  string
+	Ctx  string
+	Cnt  string
 }
 
 // A Logger writes key/value pairs to a Handler
@@ -126,19 +135,23 @@ type logger struct {
 	h   *swapHandler
 }
 
-func (l *logger) write(msg string, lvl Lvl, ctx []interface{}) {
+func (l *logger) write(msg string, lvl Lvl, ctx []interface{}, skip int) {
 	l.h.Log(&Record{
 		Time: time.Now(),
 		Lvl:  lvl,
 		Msg:  msg,
+		Cnt:  gLogCounter,
 		Ctx:  newContext(l.ctx, ctx),
-		Call: stack.Caller(2),
+		Call: stack.Caller(skip),
 		KeyNames: RecordKeyNames{
 			Time: timeKey,
 			Msg:  msgKey,
 			Lvl:  lvlKey,
+			Ctx:  ctxKey,
+			Cnt:  cntkey,
 		},
 	})
+	gLogCounter++
 }
 
 func (l *logger) New(ctx ...interface{}) Logger {
@@ -156,27 +169,27 @@ func newContext(prefix []interface{}, suffix []interface{}) []interface{} {
 }
 
 func (l *logger) Trace(msg string, ctx ...interface{}) {
-	l.write(msg, LvlTrace, ctx)
+	l.write(msg, LvlTrace, ctx, skipLevel)
 }
 
 func (l *logger) Debug(msg string, ctx ...interface{}) {
-	l.write(msg, LvlDebug, ctx)
+	l.write(msg, LvlDebug, ctx, skipLevel)
 }
 
 func (l *logger) Info(msg string, ctx ...interface{}) {
-	l.write(msg, LvlInfo, ctx)
+	l.write(msg, LvlInfo, ctx, skipLevel)
 }
 
 func (l *logger) Warn(msg string, ctx ...interface{}) {
-	l.write(msg, LvlWarn, ctx)
+	l.write(msg, LvlWarn, ctx, skipLevel)
 }
 
 func (l *logger) Error(msg string, ctx ...interface{}) {
-	l.write(msg, LvlError, ctx)
+	l.write(msg, LvlError, ctx, skipLevel)
 }
 
 func (l *logger) Crit(msg string, ctx ...interface{}) {
-	l.write(msg, LvlCrit, ctx)
+	l.write(msg, LvlCrit, ctx, skipLevel)
 	os.Exit(1)
 }
 

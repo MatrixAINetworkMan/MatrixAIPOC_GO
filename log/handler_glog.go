@@ -57,6 +57,11 @@ func NewGlogHandler(h Handler) *GlogHandler {
 	}
 }
 
+// SetHandler updates the handler to write records to the specified sub-handler.
+func (h *GlogHandler) SetHandler(nh Handler) {
+	h.origin = nh
+}
+
 // pattern contains a filter for the Vmodule option, holding a verbosity level
 // and a file pattern to match.
 type pattern struct {
@@ -171,6 +176,8 @@ func (h *GlogHandler) BacktraceAt(location string) error {
 	return nil
 }
 
+var gGLogCounter uint = 0
+
 // Log implements Handler.Log, filtering a log record through the global, local
 // and backtrace filters, finally emitting it if either allow it through.
 func (h *GlogHandler) Log(r *Record) error {
@@ -194,6 +201,8 @@ func (h *GlogHandler) Log(r *Record) error {
 	}
 	// If the global log level allows, fast track logging
 	if atomic.LoadUint32(&h.level) >= uint32(r.Lvl) {
+		r.Cnt = gGLogCounter
+		gGLogCounter++
 		return h.origin.Log(r)
 	}
 	// If no local overrides are present, fast track skipping

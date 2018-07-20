@@ -1,28 +1,28 @@
-// Copyright 2018 The Matrix Authors
-// This file is part of the Matrix library.
+// Copyright 2018 The MATRIX Authors
+// This file is part of the MATRIX library.
 //
-// The Matrix library is free software: you can redistribute it and/or modify
+// The MATRIX library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The Matrix library is distributed in the hope that it will be useful,
+// The MATRIX library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the Matrix library. If not, see <http://www.gnu.org/licenses/>.
+// along with the MATRIX library. If not, see <http://www.gnu.org/licenses/>.
 
 package params
 
 // MainnetBootnodes are the enode URLs of the P2P bootstrap nodes running on
 // the main Ethereum network.
 var MainnetBootnodes = []string{
-	// Ethereum Foundation Go Bootnodes
-	"enode://3c435be40c4bb6f346c32fcddf8c762e27d740d7aa1b1943acdb883c585de83f92e8a4001d0a2beb93434b2774b41cd9a73ae5e95c85b87f20edb27d3b5ac337@192.168.3.220:30303", //ZH
-	"enode://04f92f6602c1b1019091f77daf98995b5da99441235a5c0998767db758cea9484019410eb74e1f5e0a1aa523eb3a3e109f5c1883bce09f217a2777f0088dc097@192.168.3.179:30303",
-	"enode://7966732079062977b6aa2e466ec09b341341bda5fd3360212559a6c6f4639b6c0e59ad947055d5c1e286948d93398c0e1c799c75d94854818a6e9ba1f9cf9cfe@192.168.3.222:30303",
+	// matrix Bootnodes
+	"enode://b624a3fb585a48b4c96e4e6327752b1ba82a90a948f258be380ba17ead7c01f6d4ad43d665bb11c50475c058d3aad1ba9a35c0e0c4aa118503bf3ce79609bef6@172.17.0.2:30303", // IE
+	"enode://dbf8dcc4c82eb2ea2e1350b0ea94c7e29f5be609736b91f0faf334851d18f8de1a518def870c774649db443fbce5f72246e1c6bc4a901ef33429fdc3244a93b3@172.17.0.3:30303", // IE
+	"enode://a9f94b62067e993f3f02ada1a448c70ae90bdbe4c6b281f8ff16c6f4832e0e9aba1827531c260b380c776938b9975ac7170a7e822f567660333622ea3e529313@172.17.0.4:30303", // IE
 }
 
 // TestnetBootnodes are the enode URLs of the P2P bootstrap nodes running on the
