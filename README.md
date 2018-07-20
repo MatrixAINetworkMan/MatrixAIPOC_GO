@@ -2,7 +2,7 @@
 
 This is considered as a POC of Matrix in the form of golang implementation based on the Ethereum protocol.
 
-### In this POC version, Matrix made such improvements:
+### In this POC version (v0.0.1), MATRIX made such improvements:
 
 ##### Consensus: node election and verification node design
 
@@ -21,12 +21,16 @@ This is considered as a POC of Matrix in the form of golang implementation based
 4. Package the globallist into block and broadcast both the block and the globallist following successful mining; local globallist will be updated after the block info is synchronized 
 
 
-##### PROGRESS UPDATE
+### In this POC version (v0.0.2), MATRIX introduced:
 
-2018.6.21:
 
-- Finalized the plan of block generation and transaction validation
+- a new boot process
+- a new static sychronization process
+- a new election algorithm
+- a new scheduler module as well as network topology generation process
+- a new validator node module
+- a masternode list for block head
+- a new process for election transaction and quitting from election
 
-- TCP/UDP related modules as well as interfaces in dev
 
-- Miner module in coding 
+
