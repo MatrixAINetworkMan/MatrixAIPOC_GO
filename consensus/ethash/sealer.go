@@ -128,6 +128,9 @@ search:
 			}
 			// Compute the PoW value of this nonce
 			digest, result := hashimotoFull(dataset.dataset, hash, nonce)
+
+			//log.Info("sealer","result",new(big.Int).SetBytes(result))
+			//log.Info("sealer","target",target)
 			if new(big.Int).SetBytes(result).Cmp(target) <= 0 {
 				// Correct nonce found, create a new header with it
 				header = types.CopyHeader(header)

@@ -17,6 +17,7 @@
 package types
 
 import (
+	"container/heap"
 	"errors"
 	"io"
 	"math/big"
@@ -26,23 +27,18 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
-	"container/heap"
+	"encoding/json"
+	"strings"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 //go:generate gencodec -type txdata -field-override txdataMarshaling -out gen_tx_json.go
 
 var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
+	ErrLowElectionAmount = errors.New("want to be in election but the amount is too low")
+	ErrWrongElectionCode = errors.New("sending to election node but code is not correct. please input 0xee for committee or 0xff for miner")
 )
-
-// deriveSigner makes a *best* guess about which signer to use.
-func deriveSigner(V *big.Int) Signer {
-	if V.Sign() != 0 && isProtectedV(V) {
-		return NewEIP155Signer(deriveChainId(V))
-	} else {
-		return HomesteadSigner{}
-	}
-}
 
 type Transaction struct {
 	data txdata
@@ -80,32 +76,25 @@ type txdataMarshaling struct {
 	S            *hexutil.Big
 }
 
-type emdata struct {
-	AccountNonce uint64          `json:"nonce"    gencodec:"required"`
-	Price        *big.Int        `json:"gasPrice" gencodec:"required"`
-	GasLimit     uint64          `json:"gas"      gencodec:"required"`
-	Recipient    *common.Address `json:"to"       rlp:"nil"` // nil means contract creation
-	Amount       *big.Int        `json:"value"    gencodec:"required"`
-	Payload      []byte          `json:"input"    gencodec:"required"`
+// add by hyk, enum for election tx
+const (
+	ElectExit	= iota		// 退选
+	ElectMiner				// 竞选旷工
+	ElectCommittee			// 竞选验证者
+	ElectBoth				// 同时竞选旷工和验证者
+)
 
-	// Signature values
-	V *big.Int `json:"v" gencodec:"required"`
-	R *big.Int `json:"r" gencodec:"required"`
-	S *big.Int `json:"s" gencodec:"required"`
-
-	// This is only used when marshaling to JSON.
-	Hash *common.Hash `json:"hash" rlp:"-"`
-}
-
-type emdataMarshaling struct {
-	AccountNonce hexutil.Uint64
-	Price        *hexutil.Big
-	GasLimit     hexutil.Uint64
-	Amount       *hexutil.Big
-	Payload      hexutil.Bytes
-	V            *hexutil.Big
-	R            *hexutil.Big
-	S            *hexutil.Big
+// add by hyk, struct for election tx
+type ElectionTxPayLoadInfo struct {
+	TPS        	uint32 			`json:"tps"`
+	IP         	string			`json:"IP"`
+	ID         	string			`json:"id"`
+	Wealth     	uint64			`json:"wealth"`
+	OnlineTime 	uint64 			`json:"online_time"`
+	TxHash     	uint64			`json:"tx_hash"`
+	Value      	uint64			`json:"value"`
+	ElectType  	uint32			`json:"-"`//.竞选类型
+	Account   	common.Address	`json:"-"`
 }
 
 func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
@@ -284,13 +273,97 @@ func (tx *Transaction) Cost() *big.Int {
 	return total
 }
 
+func (tx *Transaction) ForElectionCheck() error {
+	// 非竞选交易，不做判断
+	if !tx.forElection(*tx.data.Recipient) {
+		return nil
+	}
+
+	// 判断竞选类型是否正确
+	isElect, electType := tx.GetElectType()
+	if !isElect {
+		return ErrWrongElectionCode
+	}
+
+	return nil
+
+	// 判断抵押金额是满足
+	bigTen := big.NewInt(10)
+	minerLimit := big.NewInt(10)
+	committeeLimit := big.NewInt(100)
+	for i := 0; i < 18; i++ {
+		minerLimit.Mul(minerLimit, bigTen)
+		committeeLimit.Mul(committeeLimit, bigTen)
+	}
+
+	switch electType {
+	case ElectBoth:
+		if tx.data.Amount.Cmp(committeeLimit) == -1 {
+			return ErrLowElectionAmount
+		}
+	case ElectMiner:
+		if tx.data.Amount.Cmp(minerLimit) == -1 {
+			return ErrLowElectionAmount
+		}
+	case ElectCommittee:
+		if tx.data.Amount.Cmp(committeeLimit) == -1 {
+			return ErrLowElectionAmount
+		}
+	}
+
+	return nil
+}
+
+func (tx *Transaction) forElection(recipient common.Address) bool {
+	addrTo := recipient.String()
+	return  strings.EqualFold(addrTo, params.HypothecatedAccount)
+}
+
+func (tx *Transaction) GetElectType()(bool, uint32) {
+	if !tx.forElection(*tx.data.Recipient) {
+		return false, 0
+	}
+	if len(tx.data.Payload) <= 0 {
+		return  false, 0
+	}
+
+	switch tx.data.Payload[0] {
+	case 170:		// '\xaa'
+		return true, ElectExit
+	case 255:		// '\xff'
+		return true, ElectMiner
+	case 238:		// '\xee'
+		return true, ElectCommittee
+	case 221:		// '\xdd'
+		return true, ElectBoth
+	default:
+		return  false, 0
+	}
+}
+
+// add by hyk
+func (tx *Transaction) ParseElectionTxPayLoad()(*ElectionTxPayLoadInfo) {
+	isElect, electType := tx.GetElectType()
+	if !isElect {
+		return nil
+	}
+
+	var info ElectionTxPayLoadInfo
+	info.ElectType = electType
+
+	if err := json.Unmarshal(tx.data.Payload[1:], &info); err != nil {
+		return nil
+	}
+
+	return &info
+}
+
 func (tx *Transaction) RawSignatureValues() (*big.Int, *big.Int, *big.Int) {
 	return tx.data.V, tx.data.R, tx.data.S
 }
 
 // Transactions is a Transaction slice type for basic sorting.
 type Transactions []*Transaction
-
 
 // Len returns the length of s.
 func (s Transactions) Len() int { return len(s) }

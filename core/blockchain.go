@@ -1,19 +1,18 @@
-// Copyright 2018 The Matrix Authors
-// This file is part of the Matrix library.
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
 //
-// The Matrix library is free software: you can redistribute it and/or modify
+// The go-ethereum library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The Matrix library is distributed in the hope that it will be useful,
+// The go-ethereum library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the Matrix library. If not, see <http://www.gnu.org/licenses/>.
-
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 // Package core implements the Ethereum consensus protocol.
 package core
@@ -36,7 +35,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
-	//"github.com/ethereum/go-ethereum/election"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -44,19 +42,14 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	//"github.com/ethereum/go-ethereum/p2p"
 	"github.com/hashicorp/golang-lru"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
-	//"github.com/ethereum/go-ethereum/miner"
-	//"github.com/ethereum/go-ethereum/miner"
-	//"github.com/ethereum/go-ethereum/election"
 )
 
 var (
 	blockInsertTimer = metrics.NewRegisteredTimer("chain/inserts", nil)
 
 	ErrNoGenesis = errors.New("Genesis not found in chain")
-	ChBlockWriteEvent chan types.Header = make(chan types.Header)
 )
 
 const (
@@ -136,6 +129,10 @@ type BlockChain struct {
 	vmConfig  vm.Config
 
 	badBlocks *lru.Cache // Bad block cache
+
+	InserBlockNotify func()
+
+	HACache  map[string][]*types.Transaction			// Hypothecated Account Cache
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -168,6 +165,7 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		engine:       engine,
 		vmConfig:     vmConfig,
 		badBlocks:    badBlocks,
+		HACache:	  make(map[string][]*types.Transaction),
 	}
 	bc.SetValidator(NewBlockValidator(chainConfig, bc, engine))
 	bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine))
@@ -681,7 +679,7 @@ func (bc *BlockChain) Stop() {
 		for !bc.triegc.Empty() {
 			triedb.Dereference(bc.triegc.PopItem().(common.Hash), common.Hash{})
 		}
-		if size := triedb.Size(); size != 0 {
+		if size, _ := triedb.Size(); size != 0 {
 			log.Error("Dangling trie nodes after full cleanup")
 		}
 	}
@@ -923,33 +921,29 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 		bc.triegc.Push(root, -float32(block.NumberU64()))
 
 		if current := block.NumberU64(); current > triesInMemory {
+			// If we exceeded our memory allowance, flush matured singleton nodes to disk
+			var (
+				nodes, imgs = triedb.Size()
+				limit       = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024
+			)
+			if nodes > limit || imgs > 4*1024*1024 {
+				triedb.Cap(limit - ethdb.IdealBatchSize)
+			}
 			// Find the next state trie we need to commit
 			header := bc.GetHeaderByNumber(current - triesInMemory)
 			chosen := header.Number.Uint64()
 
-			// Only write to disk if we exceeded our memory allowance *and* also have at
-			// least a given number of tries gapped.
-			var (
-				size  = triedb.Size()
-				limit = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024
-			)
-			if size > limit || bc.gcproc > bc.cacheConfig.TrieTimeLimit {
+			// If we exceeded out time allowance, flush an entire trie to disk
+			if bc.gcproc > bc.cacheConfig.TrieTimeLimit {
 				// If we're exceeding limits but haven't reached a large enough memory gap,
 				// warn the user that the system is becoming unstable.
-				if chosen < lastWrite+triesInMemory {
-					switch {
-					case size >= 2*limit:
-						log.Warn("State memory usage too high, committing", "size", size, "limit", limit, "optimum", float64(chosen-lastWrite)/triesInMemory)
-					case bc.gcproc >= 2*bc.cacheConfig.TrieTimeLimit:
-						log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", bc.cacheConfig.TrieTimeLimit, "optimum", float64(chosen-lastWrite)/triesInMemory)
-					}
+				if chosen < lastWrite+triesInMemory && bc.gcproc >= 2*bc.cacheConfig.TrieTimeLimit {
+					log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", bc.cacheConfig.TrieTimeLimit, "optimum", float64(chosen-lastWrite)/triesInMemory)
 				}
-				// If optimum or critical limits reached, write to disk
-				if chosen >= lastWrite+triesInMemory || size >= 2*limit || bc.gcproc >= 2*bc.cacheConfig.TrieTimeLimit {
-					triedb.Commit(header.Root, true)
-					lastWrite = chosen
-					bc.gcproc = 0
-				}
+				// Flush an entire trie and restart the counters
+				triedb.Commit(header.Root, true)
+				lastWrite = chosen
+				bc.gcproc = 0
 			}
 			// Garbage collect anything below our required write retention
 			for !bc.triegc.Empty() {
@@ -995,8 +989,8 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	// Set new head.
 	if status == CanonStatTy {
 		bc.insert(block)
-		//CONTROL THE BLOCK AT THE SAME TIME
-		ChBlockWriteEvent <- *block.Header()
+		bc.InserBlockNotify()
+		bc.UpdateHACache(block)
 	}
 	bc.futureBlocks.Remove(block.Hash())
 	return status, nil
@@ -1018,6 +1012,10 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 // only reason this method exists as a separate one is to make locking cleaner
 // with deferred statements.
 func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) {
+	// Sanity check that we have something meaningful to import
+	if len(chain) == 0 {
+		return 0, nil, nil, nil
+	}
 	// Do a sanity check that the provided chain is actually ordered and linked
 	for i := 1; i < len(chain); i++ {
 		if chain[i].NumberU64() != chain[i-1].NumberU64()+1 || chain[i].ParentHash() != chain[i-1].Hash() {
@@ -1055,6 +1053,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 	}
 	abort, results := bc.engine.VerifyHeaders(bc, headers, seals)
 	defer close(abort)
+
+	// Start a parallel signature recovery (signer will fluke on fork transition, minimal perf loss)
+	senderCacher.recoverFromBlocks(types.MakeSigner(bc.chainConfig, chain[0].Number()), chain)
 
 	// Iterate over the blocks and insert when the verifier permits
 	for i, block := range chain {
@@ -1190,7 +1191,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		}
 		stats.processed++
 		stats.usedGas += usedGas
-		stats.report(chain, i, bc.stateCache.TrieDB().Size())
+
+		cache, _ := bc.stateCache.TrieDB().Size()
+		stats.report(chain, i, cache)
 	}
 	// Append a single chain head event if we've progressed the chain
 	if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
@@ -1396,78 +1399,21 @@ func (bc *BlockChain) update() {
 	}
 }
 
-/*
-//blockchain time sequence control module
-func (bc *BlockChain) stateCtrl() {
-	for {
-		//blockHeader = <- ChBlockWriteEvent
-		//log.Info("state ctrl, rcv new block", "preHash",blockHeader.ParentHash, "block height", blockHeader.Number)
-		bh := <-ChBlockWriteEvent
-		blockNum := bh.Number.Uint64()
-		log.Info("***ELECTION***Block Chain Ctrl", "Rcv Block Num：", blockNum, "BLOCK DIFFICULT:", bh.Difficulty.Uint64())
-		TestNodeNum := 9
-		var otherTestNode election.ListNodeInfo
-		//Block height value used as the time driver to produce the election process
-		if blockNum%masterNodeBroadcastPriod == blockEffectDelay {
-			block := bc.GetBlockByNumber(uint64(blockNum - blockEffectDelay))
-			bufferInd := (electionconfig.PingPongInd + 1) & 1
-			//Simulate the masternode list; default as the one from the first local machine
-			masterListInfoPtr := electionconfig.ElectionNet[bufferInd].MasterList
-			masterListInfoPtr.SetMasterNodeNum(0)
-			masterListInfoPtr.SetPreHash(block.ParentHash().Big().Uint64())
-			log.Info("ELECTION", "PreHash", block.ParentHash().Big().Uint64())
-			masterListInfoPtr.AddMasterNodeInfo(&LocalMasterNodeInfo)
-			for nodeLoop := 1; nodeLoop < TestNodeNum; nodeLoop++ {
-				otherTestNode.AnnonceRate = uint32(100 + nodeLoop)
-				otherTestNode.Ip = "192.168.100." + string(0x30+nodeLoop)
-				otherTestNode.NodeId = uint32(nodeLoop)
-				otherTestNode.MortgageAccount = uint64(10000 / (nodeLoop + 1))
-				otherTestNode.TxHash = uint64(nodeLoop+10000)
-				otherTestNode.Upime = uint64(1000)
-				masterListInfoPtr.AddMasterNodeInfo(&otherTestNode)
-			}
-			election.ChElectionStart <- &electionconfig.ElectionNet[bufferInd]
-			log.Info("***ELECTION***Read BroadcastBlock：", "BROADCAST NUM : ", block.Number().Uint64(),  "MASTER NODE NUM :", masterListInfoPtr.GetMsaterListLen())
-			log.Info("***ELECTION*** ELC INFO: ", "MASTERNODE NUM : ", masterListInfoPtr.GetMsaterListLen(), "CAL NET REGION NUM : ", electionconfig.ElectionNet[bufferInd].CalcullatorRegionNum, "VER NET REGION NUM :", electionconfig.ElectionNet[bufferInd].VerifierRegionNum)
-		}
-		if blockNum%masterNodeBroadcastPriod == electionNetEffterTime {
-			log.Info("***ELECTION***Update Net", "Block Num", blockNum)
-			//Start or stop miner based on the election info
-			//If the the number of peers is 0 and is one of the three default nodes, then minning is started directly; otherwise, use the election network
-			bufferInd := (electionconfig.PingPongInd + 0) & 1
-			if (p2p.PeerCountNum > 0) || (LocalMasterNodeInfo.Ip!="192.168.123.72"){
-				if LocalMasterNodeInfo.IsMinner( &electionconfig.ElectionNet[bufferInd]){
-					//MinerStart
-				}else{
-					//miner stop
-				}
-			}
-			electionconfig.PingPongInd = (electionconfig.PingPongInd + 1) & 1
-		}
-	}
-}
-*/
-// BadBlockArgs represents the entries in the list returned when bad blocks are queried.
-type BadBlockArgs struct {
-	Hash   common.Hash   `json:"hash"`
-	Header *types.Header `json:"header"`
-}
-
 // BadBlocks returns a list of the last 'bad blocks' that the client has seen on the network
-func (bc *BlockChain) BadBlocks() ([]BadBlockArgs, error) {
-	headers := make([]BadBlockArgs, 0, bc.badBlocks.Len())
+func (bc *BlockChain) BadBlocks() []*types.Block {
+	blocks := make([]*types.Block, 0, bc.badBlocks.Len())
 	for _, hash := range bc.badBlocks.Keys() {
-		if hdr, exist := bc.badBlocks.Peek(hash); exist {
-			header := hdr.(*types.Header)
-			headers = append(headers, BadBlockArgs{header.Hash(), header})
+		if blk, exist := bc.badBlocks.Peek(hash); exist {
+			block := blk.(*types.Block)
+			blocks = append(blocks, block)
 		}
 	}
-	return headers, nil
+	return blocks
 }
 
 // addBadBlock adds a bad block to the bad-block LRU cache
 func (bc *BlockChain) addBadBlock(block *types.Block) {
-	bc.badBlocks.Add(block.Header().Hash(), block.Header())
+	bc.badBlocks.Add(block.Hash(), block)
 }
 
 // reportBlock logs a bad block error.
@@ -1621,3 +1567,36 @@ func (bc *BlockChain) SubscribeChainSideEvent(ch chan<- ChainSideEvent) event.Su
 func (bc *BlockChain) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription {
 	return bc.scope.Track(bc.logsFeed.Subscribe(ch))
 }
+
+func (bc *BlockChain) InserBlockNotify2Schedeuler(f func()){
+	bc.InserBlockNotify = f
+}
+
+func (bc *BlockChain) UpdateHACache(block *types.Block) {
+	config := bc.Config()
+	height := bc.CurrentBlock().Header().Number
+	sender := types.MakeSigner(config, height)
+	txList := block.Transactions()
+	for _, tx := range txList{
+		if isElect, _ := tx.GetElectType(); isElect {
+			fromAdd, err := types.Sender(sender, tx)
+			if err != nil {
+				log.Warn("HACache: elect tx get from addr err!!", "tx", tx)
+				continue
+			}
+
+			keyFrom:=fromAdd.String()
+			log.Info("HACache: begin save elect tx", "from", keyFrom, "tx", tx.Hash())
+			//BlockCache[key_from_1] = append(BlockCache[key_from_1], trade[i])
+			if _,ok:=bc.HACache[keyFrom];ok{
+				bc.HACache[keyFrom]=append(bc.HACache[keyFrom],tx)
+			}else{
+				var temp []*types.Transaction
+				temp=append(temp,tx)
+				bc.HACache[keyFrom]=temp
+			}
+			log.Info("HACache: after", "cache", bc.HACache[keyFrom])
+		}
+	}
+}
+

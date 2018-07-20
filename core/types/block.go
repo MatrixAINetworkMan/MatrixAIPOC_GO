@@ -1,20 +1,21 @@
-// Copyright 2014 The go-ethereum Authors
-// This file is part of the go-ethereum library.
+// Copyright 2018 The MATRIX Authors
+// This file is part of the MATRIX library.
 //
-// The go-ethereum library is free software: you can redistribute it and/or modify
+// The MATRIX library is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// The go-ethereum library is distributed in the hope that it will be useful,
+// The MATRIX library is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// along with the MATRIX library. If not, see <http://www.gnu.org/licenses/>.
 
-// Package types contains data types related to Ethereum consensus.
+
+// Package types contains data types related to MATRIX consensus.
 package types
 
 import (
@@ -22,7 +23,6 @@ import (
 	"io"
 	"math/big"
 	"sort"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto/sha3"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/election"
 )
 
 var (
@@ -82,6 +83,10 @@ type Header struct {
 	GasUsed     uint64         `json:"gasUsed"          gencodec:"required"`
 	Time        *big.Int       `json:"timestamp"        gencodec:"required"`
 	Extra       []byte         `json:"extraData"        gencodec:"required"`
+	MinerList   []election.NodeInfo   `json:"MinerList"        gencodec:"required"`
+	CommitteeList []election.NodeInfo `json:"CommitteeList"        gencodec:"required"`
+	Both          []election.NodeInfo  `json:"Both"        gencodec:"required"`
+	OfflineList   []election.NodeInfo  `json:"OfflineList"        gencodec:"required"`
 	MixDigest   common.Hash    `json:"mixHash"          gencodec:"required"`
 	Nonce       BlockNonce     `json:"nonce"            gencodec:"required"`
 }
@@ -119,13 +124,17 @@ func (h *Header) HashNoNonce() common.Hash {
 		h.GasUsed,
 		h.Time,
 		h.Extra,
+		h.MinerList,
+		h.CommitteeList,
+		h.Both,
+		h.OfflineList,
 	})
 }
 
 // Size returns the approximate memory used by all internal contents. It is used
 // to approximate and limit the memory consumption of various caches.
 func (h *Header) Size() common.StorageSize {
-	return common.StorageSize(unsafe.Sizeof(*h)) + common.StorageSize(len(h.Extra)+(h.Difficulty.BitLen()+h.Number.BitLen()+h.Time.BitLen())/8)
+	return common.StorageSize(unsafe.Sizeof(*h)) + common.StorageSize(len(h.MinerList)+len(h.CommitteeList)+len(h.Both)+len(h.OfflineList)+len(h.Extra)+(h.Difficulty.BitLen()+h.Number.BitLen()+h.Time.BitLen())/8)
 }
 
 func rlpHash(x interface{}) (h common.Hash) {
@@ -160,37 +169,7 @@ type Block struct {
 	// inter-peer block relay.
 	ReceivedAt   time.Time
 	ReceivedFrom interface{}
-	Eem          ElectionMessage //	IP           string
 }
-
-type ElectionMessage []struct {
-	Ip              string
-	AnnonceRate     uint32
-	NodeId          uint32
-	MortgageAccount uint64
-	UpTime          uint64
-	TxId            uint64
-	RecElecMsgTime  uint64
-}
-
-type MyElectionMsg struct {
-	Ip              string
-	AnnonceRate     uint32
-	NodeId          uint32
-	MortgageAccount uint64
-	UpTime          uint64
-	TxId            uint64
-	RecElecMsgTime  uint64
-}
-
-type ElectionQueue struct {
-	Ems  ElectionMessage
-	Lock sync.RWMutex
-}
-
-var Gemq ElectionQueue
-
-//var GEM ElectionMessage
 
 // DeprecatedTd is an old relic for extracting the TD of a block. It is in the
 // code solely to facilitate upgrading the database from the old format to the
@@ -210,30 +189,8 @@ type extblock struct {
 	Header *Header
 	Txs    []*Transaction
 	Uncles []*Header
-	Eem    ElectionMessage
 }
 
-/*
-type extbolck struct {
-	Header       *Header
-	Uncles       []*Header
-	Transactions Transactions
-
-	// caches
-	Hash atomic.Value
-	Size atomic.Value
-
-	// Td is used by package core to store the total difficulty
-	// of the chain up to and including the block.
-	Td *big.Int
-
-	// These fields are used by package eth to track
-	// inter-peer block relay.
-	ReceivedAt   time.Time
-	ReceivedFrom interface{}
-	Eem          ElectionMessage
-}
-*/
 // [deprecated by eth/63]
 // "storage" block encoding. used for database.
 type storageblock struct {
@@ -241,30 +198,7 @@ type storageblock struct {
 	Txs    []*Transaction
 	Uncles []*Header
 	TD     *big.Int
-	Eem    ElectionMessage
 }
-
-/*
-type storageblock struct {
-	Header       *Header
-	Uncles       []*Header
-	Transactions Transactions
-
-	// caches
-	Hash atomic.Value
-	Size atomic.Value
-
-	// Td is used by package core to store the total difficulty
-	// of the chain up to and including the block.
-	Td *big.Int
-
-	// These fields are used by package eth to track
-	// inter-peer block relay.
-	ReceivedAt   time.Time
-	ReceivedFrom interface{}
-	Eem          ElectionMessage
-}
-*/
 
 // NewBlock creates a new block. The input data is copied,
 // changes to header and to the field values will not affect the
@@ -329,78 +263,53 @@ func CopyHeader(h *Header) *Header {
 		cpy.Extra = make([]byte, len(h.Extra))
 		copy(cpy.Extra, h.Extra)
 	}
+	if len(h.MinerList) > 0 {
+		cpy.MinerList = make([]election.NodeInfo , len(h.MinerList))
+		copy(cpy.MinerList, h.MinerList)
+	}
+	if len(h.Both) > 0 {
+		cpy.Both = make([]election.NodeInfo, len(h.Both))
+		copy(cpy.Both, h.Both)
+	}
+	if len(h.CommitteeList) > 0 {
+		cpy.CommitteeList = make([]election.NodeInfo, len(h.CommitteeList))
+		copy(cpy.CommitteeList, h.CommitteeList)
+	}
+	if len(h.OfflineList) > 0 {
+		cpy.OfflineList = make([]election.NodeInfo, len(h.OfflineList))
+		copy(cpy.OfflineList, h.OfflineList)
+	}
 	return &cpy
 }
 
 // DecodeRLP decodes the Ethereum
-/*
-func (b *Block) DecodeRLP(s *rlp.Stream) error {
-	var eb extbolck
-	_, size, _ := s.Kind()
-	if err := s.Decode(&eb); err != nil {
-		//		fmt.Println("***********************", err)
-		return err
-	}
-
-	b.header, b.uncles, b.transactions, b.hash, b.size, b.td, b.ReceivedAt, b.ReceivedFrom, b.Eem = eb.Header, eb.Uncles, eb.Transactions, eb.Hash, eb.Size, eb.Td, eb.ReceivedAt, eb.ReceivedFrom, eb.Eem
-	b.size.Store(common.StorageSize(rlp.ListSize(size)))
-	return nil
-}
-*/
-
 func (b *Block) DecodeRLP(s *rlp.Stream) error {
 	var eb extblock
 	_, size, _ := s.Kind()
 	if err := s.Decode(&eb); err != nil {
 		return err
 	}
-	b.header, b.uncles, b.transactions, b.Eem = eb.Header, eb.Uncles, eb.Txs, eb.Eem
+	b.header, b.uncles, b.transactions = eb.Header, eb.Uncles, eb.Txs
 	b.size.Store(common.StorageSize(rlp.ListSize(size)))
 	return nil
 }
 
 // EncodeRLP serializes b into the Ethereum RLP block format.
-/*
-func (b *Block) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, extbolck{
-		Header:       b.header,
-		Transactions: b.transactions,
-		Uncles:       b.uncles,
-		Hash:         b.hash,
-		Size:         b.size,
-		Td:           b.td,
-		ReceivedAt:   b.ReceivedAt,
-		ReceivedFrom: b.ReceivedFrom,
-		Eem:          b.Eem,
-	})
-}
-*/
 func (b *Block) EncodeRLP(w io.Writer) error {
 	return rlp.Encode(w, extblock{
 		Header: b.header,
 		Txs:    b.transactions,
 		Uncles: b.uncles,
-		Eem:    b.Eem,
 	})
 }
 
 // [deprecated by eth/63]
-/*
 func (b *StorageBlock) DecodeRLP(s *rlp.Stream) error {
 	var sb storageblock
 	if err := s.Decode(&sb); err != nil {
 		return err
 	}
-	b.header, b.uncles, b.transactions, b.hash, b.size, b.td, b.ReceivedAt, b.ReceivedFrom, b.Eem = sb.Header, sb.Uncles, sb.Transactions, sb.Hash, sb.Size, sb.Td, sb.ReceivedAt, sb.ReceivedFrom, sb.Eem
-	return nil
-}
-*/
-func (b *StorageBlock) DecodeRLP(s *rlp.Stream) error {
-	var sb storageblock
-	if err := s.Decode(&sb); err != nil {
-		return err
-	}
-	b.header, b.uncles, b.transactions, b.td, b.Eem = sb.Header, sb.Uncles, sb.Txs, sb.TD, sb.Eem
+	b.header, b.uncles, b.transactions, b.td = sb.Header, sb.Uncles, sb.Txs, sb.TD
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/election"
 )
 
 var _ = (*headerMarshaling)(nil)
@@ -31,6 +32,10 @@ func (h Header) MarshalJSON() ([]byte, error) {
 		MixDigest   common.Hash    `json:"mixHash"          gencodec:"required"`
 		Nonce       BlockNonce     `json:"nonce"            gencodec:"required"`
 		Hash        common.Hash    `json:"hash"`
+		MinerList   []election.NodeInfo   `json:"MinerList"        gencodec:"required"`
+		CommitteeList []election.NodeInfo `json:"CommitteeList"        gencodec:"required"`
+		Both          []election.NodeInfo  `json:"Both"        gencodec:"required"`
+		OfflineList   []election.NodeInfo  `json:"OfflineList"        gencodec:"required"`
 	}
 	var enc Header
 	enc.ParentHash = h.ParentHash
@@ -49,6 +54,10 @@ func (h Header) MarshalJSON() ([]byte, error) {
 	enc.MixDigest = h.MixDigest
 	enc.Nonce = h.Nonce
 	enc.Hash = h.Hash()
+	enc.MinerList = h.MinerList
+	enc.CommitteeList = h.CommitteeList
+	enc.Both = h.Both
+	enc.OfflineList = h.OfflineList
 	return json.Marshal(&enc)
 }
 
@@ -69,6 +78,10 @@ func (h *Header) UnmarshalJSON(input []byte) error {
 		Extra       *hexutil.Bytes  `json:"extraData"        gencodec:"required"`
 		MixDigest   *common.Hash    `json:"mixHash"          gencodec:"required"`
 		Nonce       *BlockNonce     `json:"nonce"            gencodec:"required"`
+		MinerList   *[]election.NodeInfo   `json:"MinerList"        gencodec:"required"`
+		CommitteeList *[]election.NodeInfo `json:"CommitteeList"        gencodec:"required"`
+		Both          *[]election.NodeInfo  `json:"Both"        gencodec:"required"`
+		OfflineList   *[]election.NodeInfo  `json:"OfflineList"        gencodec:"required"`
 	}
 	var dec Header
 	if err := json.Unmarshal(input, &dec); err != nil {
@@ -126,6 +139,10 @@ func (h *Header) UnmarshalJSON(input []byte) error {
 		return errors.New("missing required field 'extraData' for Header")
 	}
 	h.Extra = *dec.Extra
+	h.MinerList = *dec.MinerList
+	h.CommitteeList = *dec.CommitteeList
+	h.Both = *dec.Both
+	h.OfflineList = *dec.OfflineList
 	if dec.MixDigest == nil {
 		return errors.New("missing required field 'mixHash' for Header")
 	}
