@@ -1,23 +1,22 @@
 package scheduler
 
 import (
-	"context"
-	"math/big"
-	"strings"
 	"sync"
-
-	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"context"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/election"
 	"github.com/ethereum/go-ethereum/election/manhash"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/verify"
+	"math/big"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"strings"
 )
 
 const (
@@ -33,9 +32,6 @@ const (
 	ORDINATY
 )
 
-type INode interface {
-	start()
-}
 
 type Ipinfo struct {
 	Ip           string
@@ -45,7 +41,7 @@ type Ipinfo struct {
 const NODEMAXNUM = 20000
 
 type Scheduler struct {
-	running        bool
+	running		bool
 	nodetype       int        //0:矿工节点，1：一般矿工，2：验证节点，3：一般验证节点,4:钱包节点，-1非法节点
 	prenodetype    int        //0:矿工节点，1：一般矿工，2：验证节点，3：一般验证节点,4:钱包节点，-1非法节点
 	ch2            chan int32 //区块同步后向网络拓扑模块写入主节点列表
@@ -64,15 +60,6 @@ type Scheduler struct {
 	chainConfig    *params.ChainConfig
 	Startmining    func()
 	Stoptmining    func()
-}
-
-func getrandomleafnode() (ip []Ipinfo, err error) {
-	return ip, nil
-
-}
-
-func getsubnode() (ip []Ipinfo, err error) {
-	return ip, nil
 }
 
 func (self *Scheduler) getnodelistfrombootnodes() (err error) {
@@ -98,52 +85,6 @@ func (self *Scheduler) getnodelistfrombootnodes() (err error) {
 }
 
 func (self *Scheduler) startconnect() {
-
-	//var iplist []Ipinfo
-	var ch2 chan []Ipinfo //向网络拓扑模块写入主节点列表
-	ch2 = make(chan []Ipinfo)
-	iplist := make([]Ipinfo, 3, NODEMAXNUM)
-	switch self.nodetype {
-	case 0:
-	case 2:
-		supernodeinfo := self.ele[self.eleEffterIndex].GetSuperMiner()
-
-		//elf.ele.GetChildIP()
-		//go vpnconnect(iplist)
-		temp := self.ele[self.eleEffterIndex].GetSuperCommittee()
-		supernodeinfo = append(temp)
-		supernodeinfo = supernodeinfo
-		//go vpnconnect(iplist)
-		//temp , _= getsubnode()
-		//ip:=self.ele.GetChildIP()
-		//templist := make([]Ipinfo, 2)
-		//for i,v:=range ip{
-		//	templist[i].Ip = v
-		//	templist[i].Protocoltype=1
-		//}
-		//iplist = append(templist)
-		//go tcpconnect(iplist)
-		//ch2 <-iplist
-	case 1:
-	case 3:
-		iplist, _ = getsubnode()
-
-		childnodeinfo := self.ele[self.eleEffterIndex].GetChild(self.Node.ID.String())
-		childnodeinfo = childnodeinfo
-		//go tcpconnect(iplist)
-		//ch2 <-iplist
-	case 4:
-		iplist, _ = getrandomleafnode()
-		//go tcpconnect(iplist)
-		//生成网络拓扑普通节点流程
-		//iplist, _ := get2randomjudgesupernode()
-		leafnodeinfo := self.ele[self.eleEffterIndex].GetLeafNode(self.Node.ID.String())
-		leafnodeinfo = leafnodeinfo
-		//iplist = append(temp)
-		ch2 <- iplist
-	default:
-		//断开所有连接
-	}
 }
 
 func (self *Scheduler) startTask() {
@@ -212,28 +153,28 @@ func New(bc *core.BlockChain, miner *miner.Miner, chainConfig *params.ChainConfi
 	Scheduler.BlockInsertch = make(chan bool, 1)
 	Scheduler.bc.InserBlockNotify2Schedeuler(Scheduler.Setblockinsernotify)
 	Scheduler.chainConfig = chainConfig
-	//log.Info("Scheduler New","bc:",bc,"id:",discover.PubkeyID(&srv.PrivateKey.PublicKey))
-
 	return Scheduler
 }
 
 func (bc *Scheduler) copyblockNodeList(block *types.Block, to *election.NodeList) (e *election.NodeList) {
-	if 0 != len(block.Header().MinerList) {
-		to.MinerList = make([]election.NodeInfo, len(block.Header().MinerList))
-		copy(to.MinerList, block.Header().MinerList)
 
+	to.MinerList = make([]election.NodeInfo, len(block.Header().MinerList))
+	if 0 != len(block.Header().MinerList) {
+		copy(to.MinerList, block.Header().MinerList)
 	}
+
+	to.CommitteeList = make([]election.NodeInfo, len(block.Header().CommitteeList))
 	if 0 != len(block.Header().CommitteeList) {
-		to.CommitteeList = make([]election.NodeInfo, len(block.Header().CommitteeList))
 		copy(to.CommitteeList, block.Header().CommitteeList)
 	}
+
+	to.Both = make([]election.NodeInfo, len(block.Header().Both))
 	if 0 != len(block.Header().Both) {
-		to.Both = make([]election.NodeInfo, len(block.Header().Both))
 		copy(to.Both, block.Header().Both)
 	}
 
+	to.OfflineList = make([]election.NodeInfo, len(block.Header().OfflineList))
 	if 0 != len(block.Header().OfflineList) {
-		to.OfflineList = make([]election.NodeInfo, len(block.Header().OfflineList))
 		copy(to.OfflineList, block.Header().OfflineList)
 	}
 
@@ -300,10 +241,7 @@ func (self *Scheduler) offlineListmortgagedeal(offlinelist [] election.NodeInfo,
 }
 
 func (self *Scheduler) Start(Node *discover.Node, ethClient *ethclient.Client, accountManager *accounts.Manager, Startmining func(), Stoptmining func()) {
-	//var ch0 chan types.Block //主节点或特殊节点区块通知
 
-	//var ch2 chan []nodeInfo
-	//ch2 := make(chan []nodeInfo)//区块同步后向网络拓扑模块写入主节点列表
 	ch1 := make(chan bool, 1) // 网络拓扑生成通知
 	self.Node = Node
 	self.ethClient = ethClient
@@ -313,17 +251,13 @@ func (self *Scheduler) Start(Node *discover.Node, ethClient *ethclient.Client, a
 	//var block types.Block
 	self.running = true
 	log.Info("Scheduler Start:", "nodeid:", Node.ID.String())
-	//将网络拓扑ping-pong buffer传入网络拓扑生成模块
-	//inserNetworkMemroy()
-	//self.nodelist = make([]nodeInfo,3,NODEMAXNUM)
-	//go self.miner.Start(self.accountManager.Wallets()[0].Accounts()[0].Address)
+
 	for {
 		select {
 		case <-self.BlockInsertch:
 			//区块插入消息
 			blockNum := self.bc.CurrentBlock().NumberU64()
 			log.Info("Scheduler:", "NumberU64", blockNum)
-
 			//根据区块高度值作为时间驱动，产生选举处理
 			if blockNum > params.BroadcastInterval {
 				if blockNum%params.BroadcastInterval == blockEffectDelay {
@@ -331,37 +265,21 @@ func (self *Scheduler) Start(Node *discover.Node, ethClient *ethclient.Client, a
 					block := self.bc.GetBlockByNumber(uint64(blockNum - blockEffectDelay))
 					//获取主节点列表生成网络拓扑,其中广播区块是在分叉时序通知，主节点区块是在区块同步完成
 					log.Info("EffectDelay  block", "blockNum:", blockNum-blockEffectDelay)
-					log.Info("EffectDelay  block", "block:", block)
+
 					self.nodeList[self.eletempIndex] = self.copyblockNodeList(block, self.nodeList[self.eletempIndex])
-
-					//log.Info("account", self.accountManager.Wallets()[0].Accounts()[0].Address.String())
 					log.Info("EffectDelay U", "eletempIndex:", self.eletempIndex)
-					log.Info("EffectDelay  nodelist", "nodelist", self.nodeList[self.eletempIndex].Both)
+					log.Info("EffectDelay  nodelist", "nodelist", self.nodeList[self.eletempIndex])
 
-					//网络拓扑模块需要copy主节点列表，防止生成过程中有更新
-					//eleNodeList := genElenodelist(block.Nodelist)
 					log.Info("Scheduler GenNetwork")
 					go self.ele[self.eletempIndex].GenNetwork(self.nodeList[self.eletempIndex], ch1)
 				} else if blockNum%params.BroadcastInterval == electionNetEffterTime {
-					//block := self.bc.CurrentBlock()
 					//获取主节点列表生成网络拓扑,其中广播区块是在分叉时序通知，主节点区块是在区块同步完成
-					//templist, _ := getnodelistfromblock(block)
-					//to do：主节点列表提取出来需要延迟更新生成网络拓扑图-'
 					//ping pong交换
 					self.lock.Lock()
 					self.eletempIndex, self.eleEffterIndex = self.eleEffterIndex, self.eletempIndex
 					self.lock.Unlock()
-
-					block := self.bc.GetBlockByNumber(uint64(10))
-					log.Info(" block10", "data:", block)
-					log.Info("Scheduler Update GenNetwork", "eletempIndex:", self.eletempIndex)
-
-					log.Info("eletempIndex", "nodelist", self.nodeList[self.eletempIndex])
-					//self.updatemainnodelist(self.nodeList[self.eletempIndex])
 					log.Info("Scheduler Update GenNetwork", "eleEffterIndex:", self.eleEffterIndex)
-
 					log.Info("electionNetEffterTime", "nodelist", self.nodeList[self.eleEffterIndex])
-
 					self.nodetype = self.ele[self.eleEffterIndex].GetIDType(self.Node.ID.String())
 					log.Info("nodetype", "value:", self.nodetype)
 
@@ -371,7 +289,6 @@ func (self *Scheduler) Start(Node *discover.Node, ethClient *ethclient.Client, a
 						log.Info("no account")
 						continue
 					}
-
 					account := self.GetHypothecatedAccount()
 					if account != nil && strings.EqualFold(account.Address.String(), params.HypothecatedAccount) {
 						self.offlineListmortgagedeal(self.nodeList[self.eleEffterIndex].OfflineList, self.bc.HACache)
@@ -385,24 +302,18 @@ func (self *Scheduler) Start(Node *discover.Node, ethClient *ethclient.Client, a
 		case <-self.ch2:
 			//区块同步后向网络拓扑模块写入主节点列表
 			blockNum := self.bc.CurrentBlock().NumberU64()
-
 			//第一个广播周期生效前主节点列表是boot节点
 			if blockNum < params.BroadcastInterval+electionNetEffterTime {
 				log.Info("CurrentBlock.NumberU64:", "NumberU64", blockNum)
 				//d
 				self.getnodelistfrombootnodes()
 				log.Info("templist", "list:", self.nodeList[self.eletempIndex])
-
 			} else {
-				//todo:在electionNetEffterTime和blockEffectDelay生成两个列表和网络拓扑图，暂时在生效时间用前一个列表和网络拓扑图，
-
 				log.Info("scheduler", "CurrentBlock.NumberU64:", blockNum)
 				//从广播区块或更新区块里获取主节点列表
 				blockNum = calcbcnodeblocknumber(blockNum)
 				block := self.bc.GetBlockByNumber(blockNum)
-
 				self.copyblockNodeList(block, self.nodeList[self.eletempIndex])
-
 				log.Info("copyblockNodeList", "list:", self.nodeList[self.eletempIndex])
 
 			}
@@ -473,7 +384,7 @@ func (self *Scheduler) Setmainnodelistnotify() (err error) {
 
 func (self *Scheduler) Setblockinsernotify() {
 	if self.running {
-		log.Info("Setblockinsernotify")
-		self.BlockInsertch <- true
+	log.Info("Setblockinsernotify")
+	self.BlockInsertch <- true
 	}
 }
