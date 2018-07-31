@@ -1,18 +1,3 @@
-// Copyright 2018 The MATRIX Authors
-// This file is part of the MATRIX library.
-//
-// The MATRIX library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The MATRIX library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the MATRIX library. If not, see <http://www.gnu.org/licenses/>.
 package verifier
 
 import (
@@ -45,8 +30,8 @@ func mergeNodeInfo(nodeMap map[string]*types.ElectionTxPayLoadInfo, nodeList []e
 	}
 
 	for _, nodeInfo := range nodeList {
-		if _, ok := nodeMap[nodeInfo.ID]; ok{
-			// already exist!
+		if _, ok := nodeMap[nodeInfo.ID]; ok {
+			// 已存在，说明节点有新的参选退选操作，以新操作为准
 			continue
 		} else {
 			nodeMap[nodeInfo.ID] = newPayLoadInfo(&nodeInfo, electType)
@@ -54,10 +39,10 @@ func mergeNodeInfo(nodeMap map[string]*types.ElectionTxPayLoadInfo, nodeList []e
 	}
 }
 
-func (v *Verifier)GenerateMainNodeList(currentNumber uint64) (election.NodeList, error) {
+func (v *Verifier) GenerateMainNodeList(currentNumber uint64) (election.NodeList, error) {
 	var returnList election.NodeList
 
-	if (currentNumber + 2) % params.BroadcastInterval != 0 {
+	if (currentNumber+2)%params.BroadcastInterval != 0 {
 		return returnList, fmt.Errorf("block number = %d, it is not the time to generate main node list", currentNumber)
 	}
 
@@ -68,17 +53,16 @@ func (v *Verifier)GenerateMainNodeList(currentNumber uint64) (election.NodeList,
 		committeeList = nil
 		bothList = nil
 
-		// using boot info init the 0 block node list
+		// 使用boot节点作为0广播区块的主节点列表
 		committeeList = make([]election.NodeInfo, 0)
-		committeeURL := params.MainnetBootnodes[len(params.MainnetBootnodes) - 1]
-		if committeeNode, err := discover.ParseNode(committeeURL); err == nil {
-			committeeList = append(committeeList, election.NodeInfo{ID:committeeNode.ID.String(), IP: committeeNode.IP.String()})
+		if committeeNode, err := discover.ParseNode(params.MainnetBootnodes[0]); err == nil {
+			committeeList = append(committeeList, election.NodeInfo{ID: committeeNode.ID.String(), IP: committeeNode.IP.String(), Wealth: 10000})
 		}
 
 		minerList = make([]election.NodeInfo, 0)
-		for i := 0; i < len(params.MainnetBootnodes) - 1; i++ {
+		for i := 1; i < len(params.MainnetBootnodes); i++ {
 			if bootNode, err := discover.ParseNode(params.MainnetBootnodes[i]); err == nil {
-				minerList = append(minerList, election.NodeInfo{ID:bootNode.ID.String(), IP: bootNode.IP.String()})
+				minerList = append(minerList, election.NodeInfo{ID: bootNode.ID.String(), IP: bootNode.IP.String(), Wealth: 10000})
 			}
 		}
 
@@ -87,40 +71,38 @@ func (v *Verifier)GenerateMainNodeList(currentNumber uint64) (election.NodeList,
 		if nil == lastBroadcastBlk {
 			return returnList, fmt.Errorf("get last broadcast block(%d) err", lastBroadcastBlkNumber)
 		}
-
 		minerList = lastBroadcastBlk.Header().MinerList
 		committeeList = lastBroadcastBlk.Header().CommitteeList
 		bothList = lastBroadcastBlk.Header().Both
 	}
 
 	var startPos uint64
-	if currentNumber > params.BroadcastInterval - 1 {
-		startPos = currentNumber - params.BroadcastInterval + 1
+	if currentNumber > params.BroadcastInterval+1 {
+		startPos = currentNumber - params.BroadcastInterval - 1
 	} else {
 		startPos = 0
 	}
 
 	newNodeMap, err := v.GetElectionAndExitNodeInfo(startPos, currentNumber)
 	if err != nil {
-		return  returnList, err
+		return returnList, err
 	}
-
-	// merge node info list with last broadcast info
+	// 将上个广播区块中的主节点列表和本周期内出现的新参选退选合并，其中上个广播区块中退选列表不需要合并
 	mergeNodeInfo(newNodeMap, minerList, types.ElectMiner)
 	mergeNodeInfo(newNodeMap, committeeList, types.ElectCommittee)
 	mergeNodeInfo(newNodeMap, bothList, types.ElectBoth)
 
-	// Generate main node list
+	// 由合并后的map生产本周期的主节点列表
 	for _, value := range newNodeMap {
-		info := election.NodeInfo {
-			TPS:value.TPS,
-			IP:value.IP,
-			ID:value.ID,
-			Wealth:value.Wealth,
-			OnlineTime:value.OnlineTime,
-			TxHash:value.TxHash,
-			Value:value.Value,
-			Account:value.Account,
+		info := election.NodeInfo{
+			TPS:        value.TPS,
+			IP:         value.IP,
+			ID:         value.ID,
+			Wealth:     value.Wealth,
+			OnlineTime: value.OnlineTime,
+			TxHash:     value.TxHash,
+			Value:      value.Value,
+			Account:    value.Account,
 		}
 
 		switch value.ElectType {
@@ -138,13 +120,14 @@ func (v *Verifier)GenerateMainNodeList(currentNumber uint64) (election.NodeList,
 	return returnList, nil
 }
 
-func (v *Verifier)GetElectionAndExitNodeInfo(blkNumStart uint64, blkNumEnd uint64) (map[string]*types.ElectionTxPayLoadInfo, error) {
+func (v *Verifier) GetElectionAndExitNodeInfo(blkNumStart uint64, blkNumEnd uint64) (map[string]*types.ElectionTxPayLoadInfo, error) {
 	if blkNumStart > blkNumEnd {
 		return nil, fmt.Errorf("input block number index err")
 	}
 
 	infoMap := make(map[string]*types.ElectionTxPayLoadInfo)
 
+	//todo 可能需要添加，一个节点出现多次交易时，累加交易金额。考虑中间出现退出时，清空的情况
 	pos := blkNumStart
 	for ; pos <= blkNumEnd; pos++ {
 		block := v.chain.GetBlockByNumber(pos)
