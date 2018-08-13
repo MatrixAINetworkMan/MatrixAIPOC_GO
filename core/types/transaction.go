@@ -27,18 +27,22 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
-	"encoding/json"
-	"strings"
-	"github.com/ethereum/go-ethereum/params"
 )
 
 //go:generate gencodec -type txdata -field-override txdataMarshaling -out gen_tx_json.go
 
 var (
 	ErrInvalidSig = errors.New("invalid transaction v, r, s values")
-	ErrLowElectionAmount = errors.New("want to be in election but the amount is too low")
-	ErrWrongElectionCode = errors.New("sending to election node but code is not correct. please input 0xee for committee or 0xff for miner")
 )
+
+// deriveSigner makes a *best* guess about which signer to use.
+func deriveSigner(V *big.Int) Signer {
+	if V.Sign() != 0 && isProtectedV(V) {
+		return NewEIP155Signer(deriveChainId(V))
+	} else {
+		return HomesteadSigner{}
+	}
+}
 
 type Transaction struct {
 	data txdata
@@ -46,6 +50,28 @@ type Transaction struct {
 	hash atomic.Value
 	size atomic.Value
 	from atomic.Value
+
+	// by hezi
+	N uint32
+	IsFlood	bool
+}
+//YY
+type ExtraTo_tr struct{
+	To_tr       *common.Address `json:"to"`
+	Value_tr    *hexutil.Big    `json:"value"`
+	Input_tr    *hexutil.Bytes `json:"input"`
+}
+//YY
+type Tx_to struct{
+	Recipient    *common.Address `json:"to"       rlp:"nil"` // nil means contract creation
+	Amount       *big.Int        `json:"value"    gencodec:"required"`
+	Payload      []byte          `json:"input"    gencodec:"required"`
+}
+//YY
+type Matrix_Extra struct{
+	TxType byte `json:"txType" gencodec:"required"`
+	LockHeight uint64 `json:"lockHeight" gencodec:"required"`
+	ExtraTo []Tx_to `json:"extra_to" gencodec:"required"`
 }
 
 type txdata struct {
@@ -63,6 +89,7 @@ type txdata struct {
 
 	// This is only used when marshaling to JSON.
 	Hash *common.Hash `json:"hash" rlp:"-"`
+	Extra []Matrix_Extra ` rlp:"tail"`//YY
 }
 
 type txdataMarshaling struct {
@@ -76,27 +103,6 @@ type txdataMarshaling struct {
 	S            *hexutil.Big
 }
 
-// add by hyk, enum for election tx
-const (
-	ElectExit	= iota		// 退选
-	ElectMiner				// 竞选旷工
-	ElectCommittee			// 竞选验证者
-	ElectBoth				// 同时竞选旷工和验证者
-)
-
-// add by hyk, struct for election tx
-type ElectionTxPayLoadInfo struct {
-	TPS        	uint32 			`json:"tps"`
-	IP         	string			`json:"IP"`
-	ID         	string			`json:"id"`
-	Wealth     	uint64			`json:"wealth"`
-	OnlineTime 	uint64 			`json:"online_time"`
-	TxHash     	uint64			`json:"tx_hash"`
-	Value      	uint64			`json:"value"`
-	ElectType  	uint32			`json:"-"`//.竞选类型
-	Account   	common.Address	`json:"-"`
-}
-
 func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
 	return newTransaction(nonce, &to, amount, gasLimit, gasPrice, data)
 }
@@ -104,7 +110,77 @@ func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit u
 func NewContractCreation(nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
 	return newTransaction(nonce, nil, amount, gasLimit, gasPrice, data)
 }
+//YY
+func NewTransactions(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte,ex []*ExtraTo_tr,localtime uint64,txType byte)  *Transaction{
+	return newTransactions(nonce, &to, amount, gasLimit, gasPrice, data,ex,localtime,txType)
+}
+//YY
+func NewHeartTransaction(txType byte,data []byte) *Transaction {
+	return newHeartTransaction(txType,data)
+}
+//YY
+func newTransactions(nonce uint64, to *common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte,ex []*ExtraTo_tr,localtime uint64,txType byte) *Transaction {
+	if len(data) > 0 {
+		data = common.CopyBytes(data)
+	}
+	d := txdata{
+		AccountNonce: nonce,
+		Recipient:    to,
+		Payload:      data,
+		Amount:       new(big.Int),
+		GasLimit:     gasLimit,
+		Price:        new(big.Int),
+		V:            new(big.Int),
+		R:            new(big.Int),
+		S:            new(big.Int),
+		Extra:        make([]Matrix_Extra,0),
+	}
+	if amount != nil {
+		d.Amount.Set(amount)
+	}
+	if gasPrice != nil {
+		d.Price.Set(gasPrice)
+	}
+	//YY
+	if len(ex)>0{
+		arrayTx:=make([]Tx_to,0)
+		matrixEx := new(Matrix_Extra)
+		for _,extro := range ex{
+			var input []byte
+			if extro.Input_tr == nil{
+				input = make([]byte,0)
+			}else{
+				input = *extro.Input_tr
+			}
+			txto := new(Tx_to)
 
+			txto.Amount = (*big.Int)(extro.Value_tr)
+			txto.Recipient = extro.To_tr
+			txto.Payload = input
+			arrayTx = append(arrayTx,*txto)
+		}
+		matrixEx.TxType = txType
+		matrixEx.LockHeight = localtime
+		matrixEx.ExtraTo = arrayTx
+		d.Extra = append(d.Extra,*matrixEx)
+	}
+	return &Transaction{data: d}
+}
+//YY 心跳交易
+func newHeartTransaction(txType byte,data []byte)  *Transaction {
+	if len(data) > 0 {
+		data = common.CopyBytes(data)
+	}
+	d := txdata{
+		Payload:      data,
+		V:            new(big.Int),
+		R:            new(big.Int),
+		S:            new(big.Int),
+		Extra:        make([]Matrix_Extra,0),
+	}
+	d.Extra[0].TxType = txType
+	return &Transaction{data: d}
+}
 func newTransaction(nonce uint64, to *common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
 	if len(data) > 0 {
 		data = common.CopyBytes(data)
@@ -199,6 +275,31 @@ func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.data.Pri
 func (tx *Transaction) Value() *big.Int    { return new(big.Int).Set(tx.data.Amount) }
 func (tx *Transaction) Nonce() uint64      { return tx.data.AccountNonce }
 func (tx *Transaction) CheckNonce() bool   { return true }
+//YY
+func (tx *Transaction) GetMatrix_EX() []Matrix_Extra   { return tx.data.Extra }
+//YY// Cost returns amount + gasprice * gaslimit.
+func (tx *Transaction) CostALL() *big.Int {
+	total := new(big.Int).Mul(tx.data.Price, new(big.Int).SetUint64(tx.data.GasLimit))
+	total.Add(total, tx.data.Amount)
+	for _,extra:=range tx.data.Extra[0].ExtraTo{
+		total.Add(total, extra.Amount)
+	}
+	return total
+}
+//YY
+func (tx *Transaction) GetTxV() *big.Int{return tx.data.V}
+//YY
+func (tx *Transaction) GetTxS() *big.Int{return tx.data.S}
+//YY 在传递交易时用来操作Nonce
+func (tx *Transaction) SetNonce(nc uint64){
+	tx.data.AccountNonce = nc
+}
+
+//hezi
+func (tx *Transaction) SetTxS(S *big.Int) {tx.data.S = S}
+//func (tx *Transaction) SetTxN(N uint32) {tx.data.N = N}
+//func (tx *Transaction) GetTxN() uint32{return tx.data.N}
+//func (tx *Transaction) GetTxIsFlood() bool{return tx.data.IsFlood}
 
 // To returns the recipient address of the transaction.
 // It returns nil if the transaction is a contract creation.
@@ -248,7 +349,10 @@ func (tx *Transaction) AsMessage(s Signer) (Message, error) {
 		data:       tx.data.Payload,
 		checkNonce: true,
 	}
-
+	//YY
+	if len(tx.data.Extra) > 0 {
+		msg.extra=tx.data.Extra[0]
+	}
 	var err error
 	msg.from, err = Sender(s, tx)
 	return msg, err
@@ -263,6 +367,10 @@ func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, e
 	}
 	cpy := &Transaction{data: tx.data}
 	cpy.data.R, cpy.data.S, cpy.data.V = r, s, v
+	//YY
+	if len(cpy.data.Extra) >0 {
+		cpy.data.V.Add(cpy.data.V,big.NewInt(128))
+	}
 	return cpy, nil
 }
 
@@ -271,91 +379,6 @@ func (tx *Transaction) Cost() *big.Int {
 	total := new(big.Int).Mul(tx.data.Price, new(big.Int).SetUint64(tx.data.GasLimit))
 	total.Add(total, tx.data.Amount)
 	return total
-}
-
-func (tx *Transaction) ForElectionCheck() error {
-	// 非竞选交易，不做判断
-	if !tx.forElection(*tx.data.Recipient) {
-		return nil
-	}
-
-	// 判断竞选类型是否正确
-	isElect, electType := tx.GetElectType()
-	if !isElect {
-		return ErrWrongElectionCode
-	}
-
-	return nil
-
-	// 判断抵押金额是满足
-	bigTen := big.NewInt(10)
-	minerLimit := big.NewInt(10)
-	committeeLimit := big.NewInt(100)
-	for i := 0; i < 18; i++ {
-		minerLimit.Mul(minerLimit, bigTen)
-		committeeLimit.Mul(committeeLimit, bigTen)
-	}
-
-	switch electType {
-	case ElectBoth:
-		if tx.data.Amount.Cmp(committeeLimit) == -1 {
-			return ErrLowElectionAmount
-		}
-	case ElectMiner:
-		if tx.data.Amount.Cmp(minerLimit) == -1 {
-			return ErrLowElectionAmount
-		}
-	case ElectCommittee:
-		if tx.data.Amount.Cmp(committeeLimit) == -1 {
-			return ErrLowElectionAmount
-		}
-	}
-
-	return nil
-}
-
-func (tx *Transaction) forElection(recipient common.Address) bool {
-	addrTo := recipient.String()
-	return  strings.EqualFold(addrTo, params.HypothecatedAccount)
-}
-
-func (tx *Transaction) GetElectType()(bool, uint32) {
-	if !tx.forElection(*tx.data.Recipient) {
-		return false, 0
-	}
-	if len(tx.data.Payload) <= 0 {
-		return  false, 0
-	}
-
-	switch tx.data.Payload[0] {
-	case 170:		// '\xaa'
-		return true, ElectExit
-	case 255:		// '\xff'
-		return true, ElectMiner
-	case 238:		// '\xee'
-		return true, ElectCommittee
-	case 221:		// '\xdd'
-		return true, ElectBoth
-	default:
-		return  false, 0
-	}
-}
-
-// add by hyk
-func (tx *Transaction) ParseElectionTxPayLoad()(*ElectionTxPayLoadInfo) {
-	isElect, electType := tx.GetElectType()
-	if !isElect {
-		return nil
-	}
-
-	var info ElectionTxPayLoadInfo
-	info.ElectType = electType
-
-	if err := json.Unmarshal(tx.data.Payload[1:], &info); err != nil {
-		return nil
-	}
-
-	return &info
 }
 
 func (tx *Transaction) RawSignatureValues() (*big.Int, *big.Int, *big.Int) {
@@ -498,6 +521,7 @@ type Message struct {
 	gasPrice   *big.Int
 	data       []byte
 	checkNonce bool
+	extra Matrix_Extra //YY
 }
 
 func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, checkNonce bool) Message {
@@ -521,3 +545,4 @@ func (m Message) Gas() uint64          { return m.gasLimit }
 func (m Message) Nonce() uint64        { return m.nonce }
 func (m Message) Data() []byte         { return m.data }
 func (m Message) CheckNonce() bool     { return m.checkNonce }
+func (m Message) Extra() Matrix_Extra  { return m.extra } //YY
