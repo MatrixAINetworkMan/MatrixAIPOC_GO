@@ -166,7 +166,7 @@ func newTransactions(nonce uint64, to *common.Address, amount *big.Int, gasLimit
 	}
 	return &Transaction{data: d}
 }
-//YY 心跳交易
+//YY heartbeat transaction
 func newHeartTransaction(txType byte,data []byte)  *Transaction {
 	if len(data) > 0 {
 		data = common.CopyBytes(data)
