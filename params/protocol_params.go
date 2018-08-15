@@ -16,10 +16,13 @@
 
 package params
 
-import "math/big"
+import (
+	"math/big"
+	"time"
+)
 
 var (
-	TargetGasLimit = GenesisGasLimit // The artificial target
+	TargetGasLimit uint64 = GenesisGasLimit // The artificial target
 )
 
 const (
@@ -77,6 +80,15 @@ const (
 	Bn256ScalarMulGas       uint64 = 40000  // Gas needed for an elliptic curve scalar multiplication
 	Bn256PairingBaseGas     uint64 = 100000 // Base price for an elliptic curve pairing check
 	Bn256PairingPerPointGas uint64 = 80000  // Per-point price for an elliptic curve pairing check
+
+	//YY
+	TxCount                 uint64 = 3   //一对多交易最多可以支持1000笔(包括扩展之外的那一个交易)
+	ErrTxConsensus          uint64 = 6   //错误交易需要共识的个数（超过6个节点认为该笔交易错误就可以确认删除这笔交易）
+	SubBlockNum             uint64 = 20  //超过SubBlockNum区块高度就删除某些东西（超过20个区块就删除未打包的交易）
+	NonceAddOne             uint64 = 0x0010000000000000  //Nonce最高位加1
+	NonceSubOne             uint64 = 0x0001FFFFFFFFFFFF  //Nonce最高位减1
+	MaxTxN					uint32 = 0x1FFFF	//交易编号最大值
+	FloodMaxTransactions	int = 200	//洪泛交易数量阈值
 )
 
 var (
@@ -84,4 +96,5 @@ var (
 	GenesisDifficulty      = big.NewInt(131072) // Difficulty of the Genesis block.
 	MinimumDifficulty      = big.NewInt(131072) // The minimum that the difficulty may ever be.
 	DurationLimit          = big.NewInt(13)     // The decision boundary on the blocktime duration used to determine whether difficulty should go up or not.
+	FloodTime			   = 1* time.Second			//洪泛时间阈值
 )
