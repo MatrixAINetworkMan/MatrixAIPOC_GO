@@ -1,18 +1,18 @@
-// Copyright 2014 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2018 The MATRIX Authors 
+// This file is part of the MATRIX library. 
+// 
+// The MATRIX library is free software: you can redistribute it and/or modify 
+// it under the terms of the GNU Lesser General Public License as published by 
+// the Free Software Foundation, either version 3 of the License, or 
+// (at your option) any later version. 
+// 
+// The MATRIX library is distributed in the hope that it will be useful, 
+// but WITHOUT ANY WARRANTY; without even the implied warranty of 
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the 
+// GNU Lesser General Public License for more details. 
+// 
+// You should have received a copy of the GNU Lesser General Public License 
+// along with the MATRIX library. If not, see <http://www.gnu.org/licenses/>. 
 
 package core
 
@@ -200,11 +200,18 @@ type TxPool struct {
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
+
 	pending map[common.Address]*txList   // All currently processable transactions
 	queue   map[common.Address]*txList   // Queued but non-processable transactions
 	beats   map[common.Address]time.Time // Last heartbeat from each known account
 	all     *txLookup                    // All transactions to allow lookups
-	priced  *txPricedList                // All transactions sorted by price
+	//=================by hezi==================//
+	SContainer map[*big.Int]*types.Transaction
+	NContainer map[uint32]*types.Transaction
+	Special    map[common.Hash]*types.Transaction // All special transactions
+	chanmsg	 	chan structA
+	//=================================================//
+	priced *txPricedList // All transactions sorted by price
 
 	wg sync.WaitGroup // for shutdown sync
 
@@ -222,10 +229,14 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		config:      config,
 		chainconfig: chainconfig,
 		chain:       chain,
-		signer:      types.NewEIP155Signer(chainconfig.ChainID),
+		signer:      types.NewEIP155Signer(chainconfig.ChainId),
 		pending:     make(map[common.Address]*txList),
 		queue:       make(map[common.Address]*txList),
 		beats:       make(map[common.Address]time.Time),
+		SContainer:  make(map[*big.Int]*types.Transaction),    //by hezi
+		NContainer:  make(map[uint32]*types.Transaction),      //by hezi
+		chanmsg:	 make(chan structA,1),     					//by hezi
+		Special:     make(map[common.Hash]*types.Transaction), //by hezi
 		all:         newTxLookup(),
 		chainHeadCh: make(chan ChainHeadEvent, chainHeadChanSize),
 		gasPrice:    new(big.Int).SetUint64(config.PriceLimit),
@@ -250,7 +261,17 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 
 	// Start the event loop and return
 	pool.wg.Add(1)
+
+	ldb, _ = leveldb.OpenFile("./broadcastdb", nil) //by hezi
+
+	gSendst.lst.list = list.New()//hezi
+	gSendst.snlist.slist = make([]*big.Int,0)
+	gSendst.notice = make(chan *big.Int,1)
+	//gsTx.sTxmap = make(map[*big.Int]*types.Transaction)
+	//gnTx.nTxmap = make(map[uint32]*types.Transaction)
+
 	go pool.loop()
+	go pool.checkList() //hezi
 
 	return pool
 }
@@ -411,7 +432,6 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 
 	// Inject any transactions discarded due to reorgs
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
-	senderCacher.recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, false)
 
 	// validate the pool of pending transactions, this will remove
@@ -592,11 +612,6 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	if tx.Gas() < intrGas {
 		return ErrIntrinsicGas
 	}
-
-	if err := tx.ForElectionCheck(); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -609,6 +624,33 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 // whitelisted, preventing any associated transaction from being dropped out of
 // the pool due to pricing constraints.
 func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) {
+	//======================by hezi============================//
+	if tx.GetMatrix_EX() != nil && tx.GetMatrix_EX()[0].TxType == 1 {
+		from, _ := types.Sender(pool.signer, tx)
+		tmpdt := make(map[string][]byte)
+		json.Unmarshal(tx.Data(), &tmpdt)
+
+		for keydata, _ := range tmpdt {
+			hash := types.RlpHash(keydata+from.String())
+			if pool.Special[hash] != nil {
+				log.Trace("Discarding already known broadcast transaction", "hash", hash)
+				return false, fmt.Errorf("known broadcast transaction: %x", hash)
+			}
+
+			var val big.Int
+			val.Quo(pool.chain.CurrentBlock().Number(), big.NewInt(100)) //z = x/y
+			strVal := fmt.Sprintf("%v", val)
+			if strings.Contains(keydata, strVal) {
+				pool.Special[hash] = tx
+			}
+		}
+		return true, nil
+	}
+	//else {
+	//	return false, fmt.Errorf("known transaction")
+	//}
+	//========================================================//	
+	
 	// If the transaction is already known, discard it
 	hash := tx.Hash()
 	if pool.all.Get(hash) != nil {
@@ -820,9 +862,11 @@ func (pool *TxPool) addTxsLocked(txs []*types.Transaction, local bool) []error {
 
 	for i, tx := range txs {
 		var replace bool
-		if replace, errs[i] = pool.add(tx, local); errs[i] == nil && !replace {
-			from, _ := types.Sender(pool.signer, tx) // already validated
-			dirty[from] = struct{}{}
+		if replace, errs[i] = pool.add(tx, local); errs[i] == nil {
+			if !replace {
+				from, _ := types.Sender(pool.signer, tx) // already validated
+				dirty[from] = struct{}{}
+			}
 		}
 	}
 	// Only reprocess the internal state if something was actually added
@@ -966,7 +1010,7 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 	}
 	// Notify subsystem for new promoted transactions.
 	if len(promoted) > 0 {
-		go pool.txFeed.Send(NewTxsEvent{promoted})
+		pool.txFeed.Send(NewTxsEvent{promoted})
 	}
 	// If the pending limit is overflown, start equalizing allowances
 	pending := uint64(0)
@@ -1110,7 +1154,7 @@ func (pool *TxPool) demoteUnexecutables() {
 			log.Trace("Demoting pending transaction", "hash", hash)
 			pool.enqueueTx(hash, tx)
 		}
-		// If there's a gap in front, alert (should never happen) and postpone all transactions
+		// If there's a gap in front, warn (should never happen) and postpone all transactions
 		if list.Len() > 0 && list.txs.Get(nonce) == nil {
 			for _, tx := range list.Cap(0) {
 				hash := tx.Hash()
