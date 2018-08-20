@@ -85,8 +85,8 @@ const (
 	TxCount                 uint64 = 3   //A maximum of 1000 one-many transactions can be supported, including the extented one
 	ErrTxConsensus          uint64 = 6   //The number of nodes to consider a transaction as error upon consensus (eg. if over 6 nodes consider a transaction as error, then it can be removed)
 	SubBlockNum             uint64 = 20  //Something will be deleted if the SubBlockNum blockheight is exceeded (unpacked transactions will be removed if there are more than 20 blocks)
-	NonceAddOne             uint64 = 0x0010000000000000  //Nonce最高位加1
-	NonceSubOne             uint64 = 0x0001FFFFFFFFFFFF  //Nonce最高位减1
+	NonceAddOne             uint64 = 0x0010000000000000  //Nonce's top digit plus 1
+	NonceSubOne             uint64 = 0x0001FFFFFFFFFFFF  //Nonce's top digit minus 1
 	MaxTxN					uint32 = 0x1FFFF	//Max Transaction Numbering
 	FloodMaxTransactions	int = 200	//Maximum Flood Transactions
 )

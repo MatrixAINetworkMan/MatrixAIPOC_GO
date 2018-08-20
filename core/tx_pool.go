@@ -17,24 +17,48 @@
 package core
 
 import (
+	"container/list"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/ca"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/syndtr/goleveldb/leveldb"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
 
+//by hezi
+const (
+	Heartbeat  = "heartbeat"
+	Publickey  = "SeedPublicKey"
+	Privatekey = "SeedPrivateKey"
+	CommTx     = "common"
+)
+
+//消息类型
+const (
+	tmpEmpty = iota  //YY
+	SendFloodSN
+	GetTxbyN
+	RecvTxbyN       //YY
+	RecvErrTx       //YY
+)
 const (
 	// chainHeadChanSize is the size of channel listening to ChainHeadEvent.
 	chainHeadChanSize = 10
@@ -76,6 +100,10 @@ var (
 	// than some meaningful limit a user might use. This is not a consensus error
 	// making the transaction invalid, rather a DOS protection.
 	ErrOversizedData = errors.New("oversized data")
+	//YY
+	ErrTXCountOverflow = errors.New("Transaction quantity spillover")
+	ErrTxToRepeat      = errors.New("Contains duplicate transfer accounts")
+	ErrTXWrongful      = errors.New("transaction is unlawful")
 )
 
 var (
@@ -103,6 +131,75 @@ var (
 
 // TxStatus is the current status of a transaction as seen by the pool.
 type TxStatus uint
+//YY TODO 根据全局锁来确定是否需要这么使用
+//type mapNSstruct struct {
+//	lk sync.RWMutex
+//	mapNS map[uint32]*big.Int
+//}
+//
+//func (m *mapNSstruct)FindData(n uint32) *big.Int {
+//	m.lk.RUnlock()
+//	defer m.lk.RUnlock()
+//	return m.mapNS[n]
+//}
+
+
+var mapNS = make(map[uint32]*big.Int)                  //YY
+var mapErrtxs = make(map[common.Hash][]common.Address)    //YY  用来存放错误的交易（map[S,addr]）
+var mapLossErrtxs = make(map[*big.Int][]common.Address)//YY  用来存放本地不存在的错误交易（每当有新的交易加进来都需要判断一下）TODO 单独写方法维护
+var mapErrtxsTiming = make(map[common.Hash]uint64)     //YY  给错误交易做定时删除（20个区块）
+var mapTxsTiming = make(map[common.Hash]uint64)        //YY  打包区块后pending中剩余的交易做定时删除
+//YY
+
+type retChan struct {
+	txs types.Transactions
+	err error
+}
+
+// hezi
+type NetworkMsgData struct {
+	NodeId discover.NodeID
+	Data   interface{}
+}
+
+type msgstruct struct {
+	msgtype	uint32
+	NodeId discover.NodeID
+	data interface{}
+}
+
+var num uint32
+var ldb *leveldb.DB
+
+//======struct
+type mapst struct {
+	//sendSNList  map[*big.Int]uint32
+	slist []*big.Int
+	mlock sync.RWMutex
+}
+type listst struct {
+	list *list.List
+	lk   sync.RWMutex
+}
+
+type sendst struct {
+	snlist mapst
+	lst    listst
+	notice chan *big.Int
+}
+
+type sTxst struct {
+	sTxmap map[*big.Int]*types.Transaction
+	rw     sync.RWMutex
+}
+
+type nTxst struct {
+	nTxmap map[uint32]*types.Transaction
+	rw     sync.RWMutex
+}
+
+//global
+var gSendst sendst
 
 const (
 	TxStatusUnknown TxStatus = iota
@@ -200,7 +297,6 @@ type TxPool struct {
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
-
 	pending map[common.Address]*txList   // All currently processable transactions
 	queue   map[common.Address]*txList   // Queued but non-processable transactions
 	beats   map[common.Address]time.Time // Last heartbeat from each known account
@@ -209,7 +305,6 @@ type TxPool struct {
 	SContainer map[*big.Int]*types.Transaction
 	NContainer map[uint32]*types.Transaction
 	Special    map[common.Hash]*types.Transaction // All special transactions
-	chanmsg	 	chan structA
 	//=================================================//
 	priced *txPricedList // All transactions sorted by price
 
@@ -235,7 +330,6 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 		beats:       make(map[common.Address]time.Time),
 		SContainer:  make(map[*big.Int]*types.Transaction),    //by hezi
 		NContainer:  make(map[uint32]*types.Transaction),      //by hezi
-		chanmsg:	 make(chan structA,1),     					//by hezi
 		Special:     make(map[common.Hash]*types.Transaction), //by hezi
 		all:         newTxLookup(),
 		chainHeadCh: make(chan ChainHeadEvent, chainHeadChanSize),
@@ -264,9 +358,9 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 
 	ldb, _ = leveldb.OpenFile("./broadcastdb", nil) //by hezi
 
-	gSendst.lst.list = list.New()//hezi
-	gSendst.snlist.slist = make([]*big.Int,0)
-	gSendst.notice = make(chan *big.Int,1)
+	gSendst.lst.list = list.New() //hezi
+	gSendst.snlist.slist = make([]*big.Int, 0)
+	gSendst.notice = make(chan *big.Int, 1)
 	//gsTx.sTxmap = make(map[*big.Int]*types.Transaction)
 	//gnTx.nTxmap = make(map[uint32]*types.Transaction)
 
@@ -309,7 +403,24 @@ func (pool *TxPool) loop() {
 				}
 				pool.reset(head.Header(), ev.Block.Header())
 				head = ev.Block
-
+				pool.BlockTiming() //YY
+				//将广播区块写入db  hezi
+				if head.Number().Uint64()%100 == 0 {
+					tmpdt := make(map[string][]byte)
+					for _, tx := range head.Transactions() {
+						if tx.GetMatrix_EX() != nil && tx.GetMatrix_EX()[0].TxType == 1 {
+							from, _ := types.Sender(pool.signer, tx)
+							json.Unmarshal(tx.Data(), &tmpdt)
+							for keydata, valdata := range tmpdt {
+								m := make(map[common.Address][]byte)
+								m[from] = valdata
+								//hash(key)当key存储
+								hash_key := types.RlpHash(keydata)
+								pool.insertdb(hash_key.Bytes(), m) //放在写入区块地方
+							}
+						}
+					}
+				}
 				pool.mu.Unlock()
 			}
 		// Be unsubscribed due to system stopped
@@ -353,6 +464,196 @@ func (pool *TxPool) loop() {
 					log.Warn("Failed to rotate local tx journal", "err", err)
 				}
 				pool.mu.Unlock()
+			}
+		}
+	}
+}
+
+//sTxmap->tx的编号N是否为nil ;hezi
+func (pool *TxPool) sTxValIsNil(s *big.Int) bool {
+	pool.mu.Lock()
+	tmpN := pool.SContainer[s].N
+	pool.mu.Unlock()
+
+	if len(tmpN) == 0 {
+		return true
+	}
+	return false
+}
+
+//给tx设置num ;hezi
+func (pool *TxPool) setTxNum(tx *types.Transaction, num uint32) {
+	pool.mu.Lock()
+	tx.N = append(tx.N, num)
+	pool.mu.Unlock()
+}
+
+//设置map[s]tx ;hezi
+func (pool *TxPool) setsTx(s *big.Int, tx *types.Transaction) {
+	pool.SContainer[s] = tx
+}
+
+//根据s获取tx ;hezi
+func (pool *TxPool) getTxbyS(s *big.Int) (tx *types.Transaction) {
+	pool.mu.Lock()
+	tx = pool.SContainer[s]
+	pool.mu.Unlock()
+	return tx
+}
+
+//设置map[n]tx ;hezi
+func (pool *TxPool) setnTx(num uint32, tx *types.Transaction) {
+	pool.mu.Lock()
+	pool.NContainer[num] = tx
+	pool.mu.Unlock()
+}
+
+//根据N获取tx ;hezi
+func (pool *TxPool) getTxbyN(num uint32) (tx *types.Transaction) {
+	pool.mu.Lock()
+	tx = pool.NContainer[num]
+	pool.mu.Unlock()
+	return tx
+}
+
+//hezi
+func (pool *TxPool) deletnTx(num uint32) {
+	delete(pool.NContainer, num)
+}
+
+//hezi
+func (pool *TxPool) deletsTx(s *big.Int) {
+	delete(pool.SContainer, s)
+}
+
+func (pool *TxPool) packageSNList() {
+	if len(gSendst.snlist.slist) == 0{
+		return
+	}
+
+	tmpsnlst := make(map[*big.Int]uint32)
+
+	//gSendst.lst.lk.Lock()
+	gSendst.lst.list.PushBack(gSendst.snlist.slist)
+	//gSendst.lst.lk.Unlock()
+
+	gSendst.snlist.mlock.Lock()
+	gSendst.snlist.slist = make([]*big.Int, 0)
+	gSendst.snlist.mlock.Unlock()
+
+	go func() {
+		//gSendst.lst.lk.Lock()
+		var next *list.Element
+		for elem := gSendst.lst.list.Front(); elem != nil; elem = next {
+			next = elem.Next()
+			for _, s := range elem.Value.([]*big.Int) {
+				if pool.sTxValIsNil(s) {
+					if num > params.MaxTxN {
+						num = 0
+					}
+					num = atomic.AddUint32(&num, 1)
+					tx := pool.getTxbyS(s)
+
+					//TODO 此处需给num拼接节点编号
+					nodeNum, _ := ca.Ide.GetNodeNumber()
+					nodeNum <<= 25
+					num += nodeNum
+					log.Info("========","transaction num",num)
+					pool.setTxNum(tx, num)
+					tmpsnlst[s] = num
+					pool.setnTx(num, tx)
+				}
+			}
+			//=================================
+			pool.sendMsg(msgstruct{msgtype:SendFloodSN,data:tmpsnlst})
+			//=================================
+			gSendst.lst.list.Remove(elem)
+		}
+		//gSendst.lst.lk.Unlock()
+	}()
+}
+
+//hezi
+func addSlist(s *big.Int) {
+	gSendst.snlist.mlock.Lock()
+	gSendst.snlist.slist = append(gSendst.snlist.slist, s)
+	gSendst.snlist.mlock.Unlock()
+}
+
+//hezi
+func (pool *TxPool) ProcessMsg(m NetworkMsgData) {
+	log.Info("===========ProcessMsg")
+	msgdata := m.Data.(msgstruct)
+	switch msgdata.msgtype {
+	case SendFloodSN: //YY
+		snmap := msgdata.data.(map[*big.Int]uint32)
+		nodeid := m.NodeId
+		pool.CheckTx(snmap,nodeid)
+	case GetTxbyN://YY
+		listN := msgdata.data.([]uint32)
+		nodeid := m.NodeId
+		pool.GetTxByN(listN,nodeid)
+	case RecvTxbyN://YY
+		recv := msgdata.data.(map[uint32]*types.Floodtxdata)
+		nodeid := m.NodeId
+		pool.RecvFloodTx(recv,nodeid)
+	case RecvErrTx: //YY//TODO 在接收到错误交易后需要附上发送者地址
+		//addr common.Address,listS []*big.Int
+		//pool.AddErrorTx()
+	}
+}
+
+//hezi
+func (pool *TxPool) sendMsg(data msgstruct) {
+	selfRole := ca.Ide.Get()
+	switch data.msgtype {
+	case SendFloodSN:
+		if selfRole == common.RoleValidator || selfRole == common.RoleMiner {
+			log.Info("===Transaction flood","selfRole",selfRole)
+			p2p.SendToGroup(common.RoleValidator, common.NetworkMsg, data)
+		}
+	case GetTxbyN://YY
+		//TODO 给固定的节点发送根据N获取Tx的请求
+	case RecvTxbyN://YY
+		//TODO 给固定的节点返回根据N获取Tx的请求
+	case RecvErrTx://YY
+		p2p.SendToSingle(data.NodeId,common.NetworkMsg,data.data)
+		//TODO 给全部验证者发送错误交易做共识
+	}
+}
+
+//hezi 不用了
+//func (pool *TxPool) analysisMessage()  {
+//	for{
+//		select {
+//		case m := <- pool.chanmsg:
+//			switch m.msgtype {
+//			case SendFloodSN:
+//				snmap := m.data.(map[*big.Int]uint32)
+//				listNwithoutS := pool.CheckTx(snmap)
+//				//TODO
+//				fmt.Println(listNwithoutS)
+//			case GetTxbyN:
+//
+//			}
+//		}
+//	}
+//}
+
+//by hezi
+func (pool *TxPool) checkList() {
+	flood := time.NewTicker(params.FloodTime)
+	defer flood.Stop()
+
+	for {
+		select {
+		case <-flood.C:
+			pool.packageSNList()
+
+		case s := <-gSendst.notice:
+			addSlist(s)
+			if len(gSendst.snlist.slist) >= params.FloodMaxTransactions {
+				pool.packageSNList()
 			}
 		}
 	}
@@ -471,6 +772,11 @@ func (pool *TxPool) SubscribeNewTxsEvent(ch chan<- NewTxsEvent) event.Subscripti
 	return pool.scope.Track(pool.txFeed.Subscribe(ch))
 }
 
+//by hezi
+func (pool *TxPool) SubscribeNewSNEvent(ch chan<- NewSNEvent) event.Subscription {
+	return pool.scope.Track(pool.txFeed.Subscribe(ch))
+}
+
 // GasPrice returns the current gas price enforced by the transaction pool.
 func (pool *TxPool) GasPrice() *big.Int {
 	pool.mu.RLock()
@@ -554,6 +860,278 @@ func (pool *TxPool) Pending() (map[common.Address]types.Transactions, error) {
 	return pending, nil
 }
 
+//YY 检查当前map中是否存在洪泛过来的交易
+func (pool *TxPool) CheckTx(mapSN map[*big.Int]uint32,nid discover.NodeID) {
+	listN := make([]uint32, 0)
+	for s, n := range mapSN {
+		if s == nil || n == 0 { //如果S或者N 不合法则直接跳过
+			continue
+		}
+		mapNS[n] = s
+		tx := pool.getTxbyS(s)
+		//tx := pool.SContainer [s]
+		if tx == nil {
+			listN = append(listN, n)
+		} else {
+			isExist := true
+			for _, txn := range tx.N { //如果有重复的N就不添加了
+				if txn == n {
+					isExist = false
+					break
+				}
+			}
+			if isExist{
+				pool.setTxNum(tx,n)
+				//tx.N = append(tx.N,n)
+			}
+			pool.setnTx(n, tx)
+			//pool.NContainer[n] = tx
+		}
+	}
+	if len(listN) > 0 {
+		pool.sendMsg(msgstruct{GetTxbyN,nid,listN})
+	}
+}
+
+//YY 将洪泛得到的N值插入map 废弃
+func (pool *TxPool) InsertMapN(mapSN map[*big.Int]uint32) {
+	//pool.mu.Lock()
+	//defer pool.mu.Unlock()
+	//
+	//for s,n:=range mapSN{
+	//	tx:=pool.SContainer[s]
+	//	if tx != nil {
+	//		//pool.RemoteNTx[n] = tx
+	//	}
+	//}
+}
+
+//YY 接收到Leader打包的交易共识消息时根据N获取tx (调用本方法需要启动协程)
+func (pool *TxPool) ReturnAllTxsByN(listN []uint32, retch chan retChan) {
+
+	if len(listN) <= 0 {
+		retch <- retChan{nil, nil}
+		return
+	}
+	txs := make([]*types.Transaction, 0)
+	ns := make([]uint32, 0)
+	for _, n := range listN {
+		tx := pool.getTxbyN(n)
+		if tx != nil {
+			txs = append(txs, tx)
+		} else {
+			//当根据N找不到对应的交易时需要跟对方索要一次
+			ns = append(ns, n)
+		}
+	}
+	if len(ns) > 0 {
+		//TODO 发送缺失交易N的列表
+		func() {
+			rettime := time.NewTicker(1 * time.Second) // 1秒后没有收到需要的交易则返回
+			isOver := false
+			for {
+				tmpTime := time.NewTicker(200 * time.Millisecond) //200毫秒轮训一次
+				select {
+				case <-rettime.C:
+					isOver = true
+				case <-tmpTime.C:
+				}
+				tmpns := make([]uint32, 0)
+				for _, n := range ns {
+					tx := pool.getTxbyN(n)
+					if tx != nil {
+						txs = append(txs, tx)
+					} else {
+						tmpns = append(tmpns, n)
+					}
+				}
+				ns = tmpns
+				if isOver || len(ns) == 0 {
+					break
+				}
+			}
+			var txerr error
+			if len(ns) > 0 {
+				txs = make([]*types.Transaction, 0)
+				txerr = errors.New("loss tx")
+			}
+			retch <- retChan{txs, txerr}
+		}()
+	}
+}
+
+//YY 根据N值获取对应的交易(洪泛)
+func (pool *TxPool) GetTxByN(listN []uint32,nid discover.NodeID) {
+
+	mapNtx := make(map[uint32]*types.Floodtxdata)
+	for _, n := range listN {
+		tx := pool.getTxbyN(n)
+		//tx := pool.NContainer[n]
+		if tx != nil {
+			ftx := types.GetFloodData(tx)
+			mapNtx[n] = ftx
+		}
+	}
+	if len(mapNtx) > 0 {
+		pool.sendMsg(msgstruct{RecvTxbyN,nid,mapNtx})
+	}
+
+	//mapNTX := make(map[types.Transaction]uint32) //假装用来存放N,TX的map,明天删除
+	//listTx := make(types.Transactions,0)
+	//for tx,n:=range mapNTX {
+	//	for _,ln:=range listN{
+	//		if ln==n{
+	//			listTx = append(listTx,&tx)
+	//		}
+	//	}
+	//}
+	//return listTx
+}
+
+//YY 接收洪泛的交易（根据N请求到的交易）
+func (pool *TxPool) RecvFloodTx(mapNtx map[uint32]*types.Floodtxdata,nid discover.NodeID){
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	errorTxs := make([]*big.Int, 0)
+	for n, ftx := range mapNtx {
+		s := mapNS[n]
+		if s == nil || n == 0 { //如果S或者N 不合法则直接跳过
+			continue
+		}
+		tx := types.SetFloodData(ftx)
+		isExist := true
+		for _, txn := range tx.N { //如果有重复的N我就不添加了
+			if txn == n {
+				isExist = false
+				break
+			}
+		}
+		if isExist {
+			tx.N = append(tx.N, n)
+		}
+		tx.SetTxS(s)
+		err := pool.addTx(tx, false)
+		if err != nil {
+			errorTxs = append(errorTxs, s)
+		}
+	}
+	if len(errorTxs) > 0 {
+		//TODO 发送错误交易用来做共识，发送时需要签名（接收到错误交易后需要添加账户，然后调用AddErrorTx（）标明本节点认为是错误交易，同时也需要记一票）
+		//TODO 在这如何进行签名？？如何获得账户信息
+		pool.sendMsg(msgstruct{RecvErrTx,nid,errorTxs})
+	}
+}
+//YY 接收错误交易
+//问题：如果leader作弊其交易池中有一笔错误交易，其他验证者没有该笔交易，这时候洪泛给其他节点肯定会跟leader要该笔交易，这时候如果广播错误交易的S给其他节点，其他节点可能都没有这个记录
+func (pool *TxPool)RecvErrTx(){
+
+}
+//YY 删除交易池中所有的交易（all,queue,pending） 废弃
+func (pool *TxPool) DeletAllTxs() {
+	for h, _ := range pool.all.all {
+		pool.removeTx(h, true)
+	}
+}
+
+//YY 删除空的N值 废弃
+func (pool *TxPool) delMapNOfNil() {
+	//for n,tx := range pool.NContainer{
+	//	if n > 0 && tx == nil{
+	//		delete(pool.NContainer,n)
+	//	}
+	//}
+	//for n,s := range mapNS{
+	//	if n > 0 && s == nil{
+	//		delete(mapNS,n)
+	//	}
+	//}
+}
+
+//YY 刪除新增加的map中的数据
+func (pool *TxPool) deleteMap(tx *types.Transaction) {
+	//在调用的地方已经加锁了所以在此不用加锁
+	s := tx.GetTxS()
+	listn := tx.N
+	for _, n := range listn {
+		pool.deletnTx(n)
+		//delete(pool.NContainer, n)
+		delete(mapNS, n)
+	}
+	pool.deletsTx(s)
+	//delete(pool.SContainer, s)
+}
+
+//YY 删除嵌套的map(广播节点专用) 废弃
+func (pool *TxPool) delNestingMap(tx *types.Transaction) {
+	//pool.mu.Lock()
+	//defer pool.mu.Unlock()
+	//map[key,map[account,tx]]
+
+}
+
+//YY 记录错误交易（提供给身份模块） 废弃
+//func (pool *TxPool) GetErrorTxs() []uint32 {
+//	pool.mu.RLock()
+//	defer pool.mu.RUnlock()
+//	Errtxs := errorTxs
+//	errorTxs = make([]uint32, 0)
+//	return Errtxs
+//}
+
+//YY 添加并记录错误的交易
+func (pool *TxPool) AddErrorTx(addr common.Address, listS []*big.Int) {
+	for _, s := range listS {
+		tx := pool.getTxbyS(s)
+		//tx:=pool.SContainer[s]
+		if tx == nil { //如果本地没有没有S对应的交易就需要暂存，因为有可能是先收到错误交易共识后收到错误交易
+			mapLossErrtxs[s] = append(mapLossErrtxs[s], addr)
+			return
+		}
+		hash := tx.Hash()
+		for _, acc := range mapErrtxs[hash] {
+			if addr == acc { //判断当前错误交易，同一个节点是否发送过
+				return
+			}
+		}
+		mapErrtxs[hash] = append(mapErrtxs[hash], addr)
+		if uint64(len(mapErrtxs[hash])) >= params.ErrTxConsensus {
+			pool.mu.Lock()
+			pool.removeTx(hash, true)
+			pool.mu.Unlock()
+		} else {
+			pool.addBlockTiming(hash)
+		}
+	}
+}
+
+//YY 添加区块定时  //TODO 应该是每次打包完后将pending中的内容删除，pending中余下的交易放入区块定时中(这里需要重新创建一个全局的map)。
+func (pool *TxPool) addBlockTiming(hash common.Hash) {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	if _, ok := mapErrtxsTiming[hash]; ok {
+		return
+	}
+	mapErrtxsTiming[hash] = pool.chain.CurrentBlock().Number().Uint64()
+}
+
+//YY 20个区块定时删除(每次收到新区快头广播时触发)
+func (pool *TxPool) BlockTiming() {
+	blockNum := pool.chain.CurrentBlock().Number()
+	listHash := make([]common.Hash, 0)
+	for hash, num := range mapErrtxsTiming {
+		if n := new(big.Int).Sub(blockNum, new(big.Int).SetUint64(num)); n.Uint64() >= params.SubBlockNum {
+			listHash = append(listHash, hash)
+		}
+	}
+	if len(listHash) > 0 {
+		for _, hash := range listHash {
+			delete(mapErrtxsTiming, hash)
+			pool.removeTx(hash, true)
+			delete(mapErrtxs, hash)
+		}
+	}
+}
+
 // local retrieves all currently known local transactions, groupped by origin
 // account and sorted by nonce. The returned transaction set is a copy and can be
 // freely modified by calling code.
@@ -573,24 +1151,68 @@ func (pool *TxPool) local() map[common.Address]types.Transactions {
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
-	// Heuristic limit, reject transactions over 32KB to prevent DOS attacks
-	if tx.Size() > 32*1024 {
-		return ErrOversizedData
+
+	//YY add if
+	txEx := tx.GetMatrix_EX()
+	var txcount uint64
+	if len(txEx) > 0 {
+		txcount = 1
+		if len(txEx[0].ExtraTo) > 0 {
+			maptx := map[common.Address]bool{}
+			maptx[*tx.To()] = true
+			for _, tx_list := range txEx {
+				for _, txs := range tx_list.ExtraTo {
+					txcount++
+					if txs.Amount.Sign() < 0 { //验证每个被转账的金额不能小于0
+						return ErrNegativeValue
+					}
+					if txs.Recipient != nil {
+						_, ok := maptx[*txs.Recipient] //判断是否有重复的被转账地址
+						if ok {
+							return ErrTxToRepeat
+						} else {
+							maptx[*txs.Recipient] = true
+						}
+					}
+
+				}
+			}
+		}
+		// Heuristic limit, reject transactions over 32KB to prevent DOS attacks
+		var txsize uint64 = 32 * 1024
+		if uint64(tx.Size()) > txsize*txcount {
+			return ErrOversizedData
+		}
+		if txcount > params.TxCount { //验证一对多交易最多支持1000条
+			return ErrTXCountOverflow
+		}
+	} else {
+		// Heuristic limit, reject transactions over 32KB to prevent DOS attacks
+		if tx.Size() > 32*1024 {
+			return ErrOversizedData
+		}
 	}
 	// Transactions can't be negative. This may never happen using RLP decoded
 	// transactions but may occur if you create a transaction using the RPC.
 	if tx.Value().Sign() < 0 {
 		return ErrNegativeValue
 	}
+
 	// Ensure the transaction doesn't exceed the current block limit gas.
 	if pool.currentMaxGas < tx.Gas() {
 		return ErrGasLimit
 	}
+
 	// Make sure the transaction is signed properly
 	from, err := types.Sender(pool.signer, tx)
 	if err != nil {
 		return ErrInvalidSender
 	}
+	//YY 验证当V值大于128时，如果扩展交易为空则直接丢弃该交易并返回交易不合法
+	if tx.GetTxV().Cmp(big.NewInt(128)) > 0 && len(txEx) <= 0 {
+		return ErrTXWrongful
+	}
+
 	// Drop non-local transactions under our own minimal accepted gas price
 	local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network
 	if !local && pool.gasPrice.Cmp(tx.GasPrice()) > 0 {
@@ -600,14 +1222,33 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	if pool.currentState.GetNonce(from) > tx.Nonce() {
 		return ErrNonceTooLow
 	}
-	// Transactor should have enough funds to cover the costs
-	// cost == V + GP * GL
-	if pool.currentState.GetBalance(from).Cmp(tx.Cost()) < 0 {
-		return ErrInsufficientFunds
+	//YY add if
+	if len(txEx) > 0 && len(txEx[0].ExtraTo) > 0 {
+		// Transactor should have enough funds to cover the costs
+		// cost == V + GP * GL
+		if pool.currentState.GetBalance(from).Cmp(tx.CostALL()) < 0 {
+			return ErrInsufficientFunds
+		}
+	} else {
+		if pool.currentState.GetBalance(from).Cmp(tx.Cost()) < 0 {
+			return ErrInsufficientFunds
+		}
 	}
 	intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead)
 	if err != nil {
 		return err
+	}
+	//YY add if
+	if len(txEx) > 0 && len(txEx[0].ExtraTo) > 0 {
+		for _, tx_list := range txEx {
+			for _, txs := range tx_list.ExtraTo {
+				tmpintrGas, tmperr := IntrinsicGas(txs.Payload, txs.Recipient == nil, pool.homestead)
+				if tmperr != nil {
+					return tmperr
+				}
+				intrGas += tmpintrGas
+			}
+		}
 	}
 	if tx.Gas() < intrGas {
 		return ErrIntrinsicGas
@@ -625,44 +1266,75 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 // the pool due to pricing constraints.
 func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) {
 	//======================by hezi============================//
-	if tx.GetMatrix_EX() != nil && tx.GetMatrix_EX()[0].TxType == 1 {
-		from, _ := types.Sender(pool.signer, tx)
-		tmpdt := make(map[string][]byte)
-		json.Unmarshal(tx.Data(), &tmpdt)
+	if len(tx.GetMatrix_EX()) != 0 {
+		log.Info("GetMatrix_EX has data")
+		if tx.GetMatrix_EX()[0].TxType == 1 {
+			log.Info("========broadcast tx add pool")
+			from, _ := types.Sender(pool.signer, tx)
+			tmpdt := make(map[string][]byte)
+			json.Unmarshal(tx.Data(), &tmpdt)
 
-		for keydata, _ := range tmpdt {
-			hash := types.RlpHash(keydata+from.String())
-			if pool.Special[hash] != nil {
-				log.Trace("Discarding already known broadcast transaction", "hash", hash)
-				return false, fmt.Errorf("known broadcast transaction: %x", hash)
-			}
+			for keydata, _ := range tmpdt {
+				hash := types.RlpHash(keydata + from.String())
+				if pool.Special[hash] != nil {
+					log.Trace("Discarding already known broadcast transaction", "hash", hash)
+					return false, fmt.Errorf("known broadcast transaction: %x", hash)
+				}
 
-			var val big.Int
-			val.Quo(pool.chain.CurrentBlock().Number(), big.NewInt(100)) //z = x/y
-			strVal := fmt.Sprintf("%v", val)
-			if strings.Contains(keydata, strVal) {
-				pool.Special[hash] = tx
+				var val big.Int
+				val.Quo(pool.chain.CurrentBlock().Number(), big.NewInt(100)) //z = x/y
+				strVal := fmt.Sprintf("%v", val)
+				if strings.Contains(keydata, strVal) {
+					pool.Special[hash] = tx
+				}
 			}
+			return true, nil
 		}
-		return true, nil
+
 	}
-	//else {
-	//	return false, fmt.Errorf("known transaction")
-	//}
-	//========================================================//	
-	
-	// If the transaction is already known, discard it
+
+	log.Info("=========CommonTx add tx")
+	//普通交易
 	hash := tx.Hash()
+	// If the transaction is already known, discard it
 	if pool.all.Get(hash) != nil {
 		log.Trace("Discarding already known transaction", "hash", hash)
 		return false, fmt.Errorf("known transaction: %x", hash)
 	}
+
 	// If the transaction fails basic validation, discard it
 	if err := pool.validateTx(tx, local); err != nil {
 		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
 		invalidTxCounter.Inc(1)
 		return false, err
 	}
+
+	////======================by hezi============================//
+	//if tx.GetMatrix_EX() == nil ||  tx.GetMatrix_EX()[0].TxType == 0 {
+	//	// If the transaction is already known, discard it
+	//	if pool.all.Get(hash) != nil {
+	//		log.Trace("Discarding already known transaction", "hash", hash)
+	//		return false, fmt.Errorf("known transaction: %x", hash)
+	//	}
+	//
+	//	// If the transaction fails basic validation, discard it
+	//	if err := pool.validateTx(tx, local); err != nil {
+	//		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
+	//		invalidTxCounter.Inc(1)
+	//		return false, err
+	//	}
+	//	if tx.N > params.MaxTxN {
+	//		tx.N = 0
+	//	}
+	//	//pool.mu.Lock()
+	//	pool.SContainer[tx.GetTxS()] = tx
+	//	pool.NContainer[tx.N] = tx
+	//	pool.SNList[tx.GetTxS()] = tx.N
+	//	pool.TmpSNList[tx.GetTxS()] = tx.N
+	//	//pool.mu.Unlock()
+	//	tx.N ++
+	//}
+
 	// If the transaction pool is full, discard underpriced transactions
 	if uint64(pool.all.Count()) >= pool.config.GlobalSlots+pool.config.GlobalQueue {
 		// If the new transaction is underpriced, don't accept it
@@ -702,6 +1374,15 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) {
 
 		// We've directly injected a replacement transaction, notify subsystems
 		go pool.txFeed.Send(NewTxsEvent{types.Transactions{tx}})
+
+		//by hezi
+		selfRole := ca.Ide.Get()
+		if selfRole == common.RoleMiner || selfRole == common.RoleValidator{
+			pool.setsTx(tx.GetTxS(), tx)
+			if len(tx.N) == 0 {
+				gSendst.notice <- tx.GetTxS()
+			}
+		}
 
 		return old != nil, nil
 	}
@@ -947,6 +1628,10 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 			delete(pool.queue, addr)
 		}
 	}
+	//YY ========begin=========
+	pool.deleteMap(tx)
+	pool.delNestingMap(tx)
+	//===========end===========
 }
 
 // promoteExecutables moves transactions that have become processable from the
@@ -1011,6 +1696,16 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 	// Notify subsystem for new promoted transactions.
 	if len(promoted) > 0 {
 		pool.txFeed.Send(NewTxsEvent{promoted})
+		//hezi
+		selfRole := ca.Ide.Get()
+		if selfRole == common.RoleMiner || selfRole == common.RoleValidator{
+			for _, tx := range promoted {
+				pool.setsTx(tx.GetTxS(), tx)
+				if len(tx.N) == 0 {
+					gSendst.notice <- tx.GetTxS()
+				}
+			}
+		}
 	}
 	// If the pending limit is overflown, start equalizing allowances
 	pending := uint64(0)
@@ -1281,4 +1976,85 @@ func (t *txLookup) Remove(hash common.Hash) {
 	defer t.lock.Unlock()
 
 	delete(t.all, hash)
+}
+
+//
+////by hezi
+//func GetTxtype(tx *types.Transaction) (txType string) {
+//	tmpdt := make(map[string][]byte)
+//	json.Unmarshal(tx.Data(), &tmpdt)
+//	var data string
+//	for data, _ = range tmpdt {
+//	}
+//	if strings.Contains(data, Heartbeat) {
+//		txType = Heartbeat
+//	} else if strings.Contains(data, Publickey) {
+//		txType = Publickey
+//	} else if strings.Contains(data, Privatekey) {
+//		txType = Privatekey
+//	} else {
+//		txType = CommTx
+//	}
+//	return txType
+//}
+
+//by hezi
+//keydata: hash值作为key
+func (pool *TxPool) insertdb(keydata []byte, val map[common.Address][]byte) error {
+	dataval, _ := json.Marshal(val)
+	return ldb.Put(keydata, dataval, nil)
+}
+
+//by hezi
+func GetBroadcastTxsFromdb(height *big.Int, txtype string) (reqVal map[common.Address][]byte, err error) {
+	var val big.Int
+
+	val.Quo(height, big.NewInt(100)) // val = a/100
+	strVal := fmt.Sprintf("%v", val)
+	hv := types.RlpHash(strVal + txtype)
+	dataval, err := ldb.Get(hv.Bytes(), nil)
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(dataval, &reqVal)
+	return reqVal, err
+}
+
+//by hezi
+//该接口已废弃
+func (pool *TxPool) getBroadcastTxs(height *big.Int, txtype string) map[common.Address]*types.Transaction {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	var val big.Int
+	SpecialMem := make(map[common.Hash]map[common.Address]*types.Transaction)
+	val.Quo(height, big.NewInt(100))
+	strVal := fmt.Sprintf("%v", val)
+	hv := types.RlpHash(strVal + txtype)
+	return SpecialMem[hv]
+}
+
+//by hezi
+//func GetSeedTxKey(tx *types.Transaction) (seedKey interface{}) {
+//	tmpdt := make(map[string][]byte)
+//	json.Unmarshal(tx.Data(), &tmpdt)
+//
+//	for _, val := range tmpdt {
+//		rlp.DecodeBytes(val, &seedKey)
+//	}
+//	return seedKey
+//}
+
+//by hezi
+func (pool *TxPool) GetAllSpecialTxs() (reqVal map[common.Address]*types.Transaction) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	var from common.Address
+	for _, tx := range pool.Special {
+		from, _ = types.Sender(pool.signer, tx)
+		reqVal[from] = tx
+	}
+
+	return reqVal
 }
