@@ -147,8 +147,8 @@ type TxStatus uint
 var mapNS = make(map[uint32]*big.Int)                  //YY
 var mapErrtxs = make(map[common.Hash][]common.Address)    //YY  used to store improper transactions（map[S,addr]）
 var mapLossErrtxs = make(map[*big.Int][]common.Address)//YY  used to store improper transactions that don't exist locally (judge whenever new transactions come in)
-var mapErrtxsTiming = make(map[common.Hash]uint64)     //YY  给错误交易做定时删除（20个区块）
-var mapTxsTiming = make(map[common.Hash]uint64)        //YY  打包区块后pending中剩余的交易做定时删除
+var mapErrtxsTiming = make(map[common.Hash]uint64)     //YY  regular deletion on improper transactions (20 blocks)
+var mapTxsTiming = make(map[common.Hash]uint64)        //YY  regular deletion on the remaining transactions in pending after block packing
 //YY
 
 type retChan struct {
