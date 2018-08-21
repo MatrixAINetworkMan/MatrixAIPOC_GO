@@ -51,7 +51,7 @@ const (
 	CommTx     = "common"
 )
 
-//消息类型
+//Transaction Type
 const (
 	tmpEmpty = iota  //YY
 	SendFloodSN
@@ -131,7 +131,7 @@ var (
 
 // TxStatus is the current status of a transaction as seen by the pool.
 type TxStatus uint
-//YY TODO 根据全局锁来确定是否需要这么使用
+//YY TODO global lock used to determine if this needs to be done
 //type mapNSstruct struct {
 //	lk sync.RWMutex
 //	mapNS map[uint32]*big.Int
