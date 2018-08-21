@@ -404,7 +404,7 @@ func (pool *TxPool) loop() {
 				pool.reset(head.Header(), ev.Block.Header())
 				head = ev.Block
 				pool.BlockTiming() //YY
-				//将广播区块写入db  hezi
+				//write the broadcasting block to db  hezi
 				if head.Number().Uint64()%100 == 0 {
 					tmpdt := make(map[string][]byte)
 					for _, tx := range head.Transactions() {
