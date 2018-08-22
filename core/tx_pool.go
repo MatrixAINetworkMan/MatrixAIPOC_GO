@@ -414,7 +414,7 @@ func (pool *TxPool) loop() {
 							for keydata, valdata := range tmpdt {
 								m := make(map[common.Address][]byte)
 								m[from] = valdata
-								//hash(key)当key存储
+								//hash(key) saved as key
 								hash_key := types.RlpHash(keydata)
 								pool.insertdb(hash_key.Bytes(), m) //放在写入区块地方
 							}
