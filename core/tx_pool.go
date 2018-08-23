@@ -416,7 +416,7 @@ func (pool *TxPool) loop() {
 								m[from] = valdata
 								//hash(key) saved as key
 								hash_key := types.RlpHash(keydata)
-								pool.insertdb(hash_key.Bytes(), m) //放在写入区块地方
+								pool.insertdb(hash_key.Bytes(), m) //stored where the block is written
 							}
 						}
 					}
