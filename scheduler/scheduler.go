@@ -65,7 +65,7 @@ type Scheduler struct {
 	lock           sync.RWMutex
 	bc             *core.BlockChain
 	miner          *miner.Miner
-	ele            []*manhash.Election //选举对象
+	ele            []*manhash.Election //candidates
 	eleEffterIndex int
 	eletempIndex   int
 	Node           *discover.Node
