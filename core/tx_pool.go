@@ -597,7 +597,7 @@ func (pool *TxPool) ProcessMsg(m NetworkMsgData) {
 		recv := msgdata.data.(map[uint32]*types.Floodtxdata)
 		nodeid := m.NodeId
 		pool.RecvFloodTx(recv,nodeid)
-	case RecvErrTx: //YY//TODO 在接收到错误交易后需要附上发送者地址
+	case RecvErrTx: //YY//TODO Attach sender address upon receipt of error transactions
 		//addr common.Address,listS []*big.Int
 		//pool.AddErrorTx()
 	}
@@ -613,16 +613,16 @@ func (pool *TxPool) sendMsg(data msgstruct) {
 			p2p.SendToGroup(common.RoleValidator, common.NetworkMsg, data)
 		}
 	case GetTxbyN://YY
-		//TODO 给固定的节点发送根据N获取Tx的请求
+		//TODO send request of Tx based on N to fixed nodes
 	case RecvTxbyN://YY
-		//TODO 给固定的节点返回根据N获取Tx的请求
+		//TODO respond to fixed nodes about request of Tx based on N
 	case RecvErrTx://YY
 		p2p.SendToSingle(data.NodeId,common.NetworkMsg,data.data)
-		//TODO 给全部验证者发送错误交易做共识
+		//TODO send error transactions to all validators for consensus
 	}
 }
 
-//hezi 不用了
+//hezi Abandoned
 //func (pool *TxPool) analysisMessage()  {
 //	for{
 //		select {
