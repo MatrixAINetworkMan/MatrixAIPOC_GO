@@ -24,75 +24,100 @@ import (
 
 	"github.com/ethereum/go-ethereum/ca"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/mc"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 )
 
 // hash bucket
 type Bucket struct {
 	role   common.RoleType
-	bucket map[*big.Int][]discover.NodeID
+	bucket map[int64][]discover.NodeID
 
 	rings *ring.Ring
 	lock  *sync.RWMutex
 
-	BlockChain chan blockChain
-	quit       chan struct{}
-}
+	ids []discover.NodeID
 
-type blockChain struct {
-	role common.RoleType
-	head interface{}
+	sub event.Subscription
+
+	blockChain chan mc.BlockToBucket
+	quit       chan struct{}
+
+	log log.Logger
 }
 
 // Init bucket.
 var Buckets = &Bucket{
-	lock:       new(sync.RWMutex),
-	bucket:     make(map[*big.Int][]discover.NodeID),
-	quit:       make(chan struct{}),
-	BlockChain: make(chan blockChain),
-	rings:      ring.New(4),
+	role:  common.RoleNil,
+	lock:  new(sync.RWMutex),
+	ids:   make([]discover.NodeID, 0),
+	quit:  make(chan struct{}),
+	rings: ring.New(4),
 }
 
 const (
-	MaxLink    = 3
-	MaxContent = 2000
+	MaxLink = 3
 )
 
 // init bucket.
 func (b *Bucket) init() {
 	for i := 0; i < b.rings.Len(); i++ {
-		b.rings.Value = big.NewInt(int64(i))
+		b.rings.Value = int64(i)
 		b.rings = b.rings.Next()
 	}
+	b.log = log.New()
 }
 
 // Start bucket.
 func (b *Bucket) Start() {
 	b.init()
 
+	b.log.Info("buckets start!")
+
 	defer func() {
+		b.log.Info("buckets stop!")
+		b.sub.Unsubscribe()
+
 		close(b.quit)
-		close(b.BlockChain)
+		close(b.blockChain)
 	}()
+
+	b.blockChain = make(chan mc.BlockToBucket)
+	b.sub, _ = mc.SubscribeEvent(mc.BlockToBuckets, b.blockChain)
 
 	for {
 		select {
-		case h := <-b.BlockChain:
-			b.role = h.role
-			b.bucketAdd(discover.NodeID{})
-			b.bucketDel(discover.NodeID{})
+		case h := <-b.blockChain:
+			// only bottom nodes will into this buckets.
+			if h.Role > common.RoleBucket {
+				continue
+			}
+			b.role = h.Role
+			b.log.Info("bucket", "receive msg:", h.Ms)
+			b.log.Info("bucket", "role", b.role)
+
+			b.ids = h.Ms
+			// maintain nodes in buckets
+			b.maintainNodes(h.Ms)
 
 			// adjust bucket order
-			header := h.head.(types.Header)
 			temp := &big.Int{}
-			if temp.Mod(header.Number, big.NewInt(300)) == big.NewInt(50) {
+			if temp.Mod(h.Height, big.NewInt(300)) == big.NewInt(50) {
 				b.rings = b.rings.Prev()
 			}
+			b.log.Info("bucket", "ids", b.ids)
+			b.log.Info("bucket", "bucket:", b.bucket)
 
+			if len(b.ids) <= 64 {
+				b.maintainOuter()
+				continue
+			}
 			// if not in bucket, do nothing
 			if b.role != common.RoleBucket {
+				b.linkBucketPeer()
 				continue
 			}
 			// maintain inner
@@ -121,6 +146,14 @@ func (b *Bucket) Stop() {
 	b.lock.Unlock()
 }
 
+// maintainNodes maintain nodes in buckets.
+func (b *Bucket) maintainNodes(elected []discover.NodeID) {
+	b.bucket = make(map[int64][]discover.NodeID)
+	for _, v := range elected {
+		b.bucketAdd(v)
+	}
+}
+
 // DisconnectMiner older disconnect miner.
 func (b *Bucket) disconnectMiner() {
 	miners := ca.Ide.GetRoleGroup(common.RoleMiner)
@@ -136,6 +169,9 @@ func (b *Bucket) disconnectMiner() {
 
 // MaintainInner maintain bucket inner.
 func (b *Bucket) maintainInner() {
+	if len(b.ids) <= 64 {
+		b.maintainOuter()
+	}
 	count := 0
 	for _, peer := range ServerP2p.Peers() {
 		if b.peerBucket(peer.ID()) == b.rings.Next().Value {
@@ -143,11 +179,11 @@ func (b *Bucket) maintainInner() {
 		}
 	}
 	if count < MaxLink {
-		if MaxLink < len(b.bucket[b.rings.Next().Value.(*big.Int)]) {
-			b.inner(MaxLink - count)
+		if MaxLink < len(b.bucket[b.rings.Next().Value.(int64)]) {
+			b.inner(MaxLink-count, b.rings.Next().Value.(int64))
 			return
 		}
-		b.inner(len(b.bucket[b.rings.Next().Value.(*big.Int)]) - count)
+		b.inner(len(b.bucket[b.rings.Next().Value.(int64)])-count, b.rings.Next().Value.(int64))
 	}
 }
 
@@ -155,6 +191,7 @@ func (b *Bucket) maintainInner() {
 func (b *Bucket) maintainOuter() {
 	count := 0
 	miners := ca.Ide.GetRoleGroup(common.RoleMiner)
+	b.log.Info("peer info", "p2p", miners)
 	for _, peer := range ServerP2p.Peers() {
 		for _, miner := range miners {
 			if peer.ID() == miner {
@@ -163,6 +200,7 @@ func (b *Bucket) maintainOuter() {
 			}
 		}
 	}
+	b.log.Info("peer count", "p2p", count)
 	if count < MaxLink {
 		if MaxLink < len(miners) {
 			b.outer(MaxLink - count)
@@ -174,10 +212,7 @@ func (b *Bucket) maintainOuter() {
 
 // SelfBucket return self bucket number.
 func (b *Bucket) selfBucket() *big.Int {
-	key, _ := ServerP2p.Self().ID.Pubkey()
-	addr := crypto.PubkeyToAddress(*key)
-	m := big.Int{}
-	return m.Mod(addr.Hash().Big(), big.NewInt(4))
+	return b.peerBucket(ServerP2p.Self().ID)
 }
 
 func (b *Bucket) peerBucket(node discover.NodeID) *big.Int {
@@ -187,6 +222,38 @@ func (b *Bucket) peerBucket(node discover.NodeID) *big.Int {
 	return m.Mod(addr.Hash().Big(), big.NewInt(4))
 }
 
+func (b *Bucket) deleteIdsById(nodeId discover.NodeID) {
+	if len(b.ids) <= 0 {
+		return
+	}
+	temp := 0
+	for index, node := range b.ids {
+		if node == nodeId {
+			temp = index
+			break
+		}
+	}
+	b.ids = append(b.ids[:temp], b.ids[temp+1:]...)
+}
+
+func (b *Bucket) linkBucketPeer() {
+	self := b.selfBucket().Int64()
+	count := 0
+	for _, peer := range ServerP2p.Peers() {
+		if b.peerBucket(peer.ID()).Int64() == self {
+			count++
+		}
+	}
+
+	if count < MaxLink {
+		if MaxLink < len(b.bucket[self]) {
+			b.inner(MaxLink-count, b.rings.Value.(int64))
+			return
+		}
+		b.inner(len(b.bucket[self])-count, b.rings.Value.(int64))
+	}
+}
+
 // BucketAdd add to bucket.
 func (b *Bucket) bucketAdd(nodeId discover.NodeID) {
 	b.lock.Lock()
@@ -194,7 +261,7 @@ func (b *Bucket) bucketAdd(nodeId discover.NodeID) {
 	key, _ := nodeId.Pubkey()
 	addr := crypto.PubkeyToAddress(*key)
 	m := big.Int{}
-	mod := m.Mod(addr.Hash().Big(), big.NewInt(4))
+	mod := m.Mod(addr.Hash().Big(), big.NewInt(4)).Int64()
 
 	b.bucket[mod] = append(b.bucket[mod], nodeId)
 	b.lock.Unlock()
@@ -203,12 +270,16 @@ func (b *Bucket) bucketAdd(nodeId discover.NodeID) {
 // BucketDel delete from bucket.
 func (b *Bucket) bucketDel(nodeId discover.NodeID) {
 	b.lock.Lock()
+	defer b.lock.Unlock()
 
 	key, _ := nodeId.Pubkey()
 	addr := crypto.PubkeyToAddress(*key)
 	m := big.Int{}
-	mod := m.Mod(addr.Hash().Big(), big.NewInt(4))
+	mod := m.Mod(addr.Hash().Big(), big.NewInt(4)).Int64()
 
+	if len(b.bucket[mod]) <= 0 {
+		return
+	}
 	temp := 0
 	for index, node := range b.bucket[mod] {
 		if node == nodeId {
@@ -217,25 +288,24 @@ func (b *Bucket) bucketDel(nodeId discover.NodeID) {
 		}
 	}
 	b.bucket[mod] = append(b.bucket[mod][:temp], b.bucket[mod][temp+1:]...)
-	b.lock.Unlock()
 }
 
 // RandomPeers random peers from next buckets.
-func (b *Bucket) randomInnerPeers(num int) (nodes []discover.NodeID) {
-	length := len(b.bucket[b.rings.Next().Value.(*big.Int)])
+func (b *Bucket) randomInnerPeersByBucketNumber(num int, bucket int64) (nodes []discover.NodeID) {
+	length := len(b.bucket[b.rings.Next().Value.(int64)])
 
 	if length <= 0 {
 		return nil
 	}
 	if length <= 3 {
-		return b.bucket[b.rings.Next().Value.(*big.Int)]
+		return b.bucket[bucket]
 	}
 
 	randoms := random(length, num)
 	for _, ran := range randoms {
-		for index := range b.bucket[b.rings.Next().Value.(*big.Int)] {
+		for index := range b.bucket[bucket] {
 			if index == ran {
-				nodes = append(nodes, b.bucket[b.rings.Next().Value.(*big.Int)][index])
+				nodes = append(nodes, b.bucket[bucket][index])
 				break
 			}
 		}
@@ -266,14 +336,19 @@ func (b *Bucket) randomOuterPeers(num int) (nodes []discover.NodeID) {
 }
 
 // inner adjust inner network.
-func (b *Bucket) inner(num int) {
+func (b *Bucket) inner(num int, bucket int64) {
 	if num <= 0 {
 		return
 	}
+	peers := b.randomInnerPeersByBucketNumber(num, bucket)
 
-	peers := b.randomInnerPeers(num)
-	for index := range peers {
-		go ServerP2p.ntab.Lookup(peers[index])
+	for _, value := range peers {
+		b.log.Info("peer", "p2p", value)
+		node := ServerP2p.ntab.Resolve(value)
+		if node != nil {
+			b.log.Info("buckets nodes", "p2p", node.ID)
+			ServerP2p.AddPeer(node)
+		}
 	}
 }
 
@@ -282,10 +357,15 @@ func (b *Bucket) outer(num int) {
 	if num <= 0 {
 		return
 	}
-
 	peers := b.randomOuterPeers(num)
-	for index := range peers {
-		go ServerP2p.ntab.Lookup(peers[index])
+
+	for _, value := range peers {
+		b.log.Info("peer", "p2p", value)
+		node := ServerP2p.ntab.Resolve(value)
+		if node != nil {
+			b.log.Info("buckets nodes", "p2p", node.ID)
+			ServerP2p.AddPeer(node)
+		}
 	}
 }
 
