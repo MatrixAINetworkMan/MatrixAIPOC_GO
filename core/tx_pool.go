@@ -554,7 +554,7 @@ func (pool *TxPool) packageSNList() {
 					num = atomic.AddUint32(&num, 1)
 					tx := pool.getTxbyS(s)
 
-					//TODO 此处需给num拼接节点编号
+					//TODO node number shall be added for num
 					nodeNum, _ := ca.Ide.GetNodeNumber()
 					nodeNum <<= 25
 					num += nodeNum
