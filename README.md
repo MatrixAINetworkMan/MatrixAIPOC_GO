@@ -4,7 +4,7 @@ This is considered as a POC of Matrix in the form of golang implementation based
 
 ### In this POC version (v0.0.1), MATRIX made such improvements:
 
-##### Consensus: node election and verification node design
+##### Consensus: node election and Validator supernode design
 
 1. Fully support the generation of Computing Power Output Network 
 
