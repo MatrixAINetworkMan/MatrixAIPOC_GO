@@ -384,7 +384,7 @@ func (v *Verifier) leaderProcessMsg(temp interface{}, data p2p.Custsend) {
 		if v.sessionPM.sessionState == sessionRxmsg2 {
 			var txs []types.Transaction
 			if err := json.Unmarshal(data.Data.Data_struct, &txs); err != nil {
-				log.Info(modulName, "Leader session rx msg2, 反序列化高度信息失败")
+				log.Info(modulName, "Leader session rx msg2, Deserializing height information fails")
 			} else {
 				log.Info(modulName, "Leader session  rx msg2, msg ", txs)
 				v.sessionPM.rxMsg2List = append(v.sessionPM.rxMsg2List, data.FromIp)
@@ -408,7 +408,7 @@ func (v *Verifier) leaderProcessMsg(temp interface{}, data p2p.Custsend) {
 		if v.sessionPM.sessionState == sessionRxmsg4 {
 			var invalidTx []uint16
 			if err := json.Unmarshal(data.Data.Data_struct, &invalidTx); err != nil {
-				log.Info(modulName, "Leader session rx msg4, 反序列化高度信息失败")
+				log.Info(modulName, "Leader session rx msg4, Deserializing height information fails")
 			} else {
 				v.sessionPM.rxMsg4List = append(v.sessionPM.rxMsg4List, data.NodeId)
 				log.Info(modulName, "Leader session  rx msg4, invalidTx", invalidTx)
@@ -434,7 +434,7 @@ func (v *Verifier) leaderProcessMsg(temp interface{}, data p2p.Custsend) {
 		if v.sessionPM.sessionState == sessionRxmsg6 {
 			var vr VoteResult
 			if err := json.Unmarshal(data.Data.Data_struct, &vr); err != nil {
-				log.Info(modulName, "Leader session rx msg6, 反序列化高度信息失败")
+				log.Info(modulName, "Leader session rx msg6, Deserializing height information fails")
 			} else {
 				log.Info(modulName, "msg6 data", data.Data.Data_struct)
 
@@ -467,14 +467,14 @@ func (v *Verifier) followerProcessMsg(temp interface{}, data p2p.Custsend) {
 	case msgSendTxReqToFollower:
 		var msg int
 		if err := json.Unmarshal(data.Data.Data_struct, &msg); err != nil {
-			log.Info(modulName, "反序列化高度信息失败", "")
+			log.Info(modulName, "Deserializing height information fails", "")
 		}
 		log.Info(modulName, "follower recv msg", msg)
 		v.followerMsgCh <- msg
 	case msgSendTxToFollower:
 		var txs []types.Transaction
 		if err := json.Unmarshal(data.Data.Data_struct, &txs); err != nil {
-			log.Info(modulName, "反序列化高度信息失败", "")
+			log.Info(modulName, "Deserializing height information fails", "")
 		} else {
 
 		}
@@ -483,7 +483,7 @@ func (v *Verifier) followerProcessMsg(temp interface{}, data p2p.Custsend) {
 	case msgSendVoteReqToFollower:
 		var msg []uint16
 		if err := json.Unmarshal(data.Data.Data_struct, &msg); err != nil {
-			log.Info("反序列化高度信息失败")
+			log.Info("Deserializing height information fails")
 		}
 		log.Info(modulName, "Follower Rcv Msg5 ", data.Data.Type, "Data", msg)
 		v.followerVoteReqCh <- msg
