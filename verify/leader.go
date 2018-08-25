@@ -263,7 +263,7 @@ func (v *Verifier) leaderNewProcess() {
 					v.sessionPM.sessionState++
 				}
 			} else if TIMEIN == status {
-				*pretimeout = TIMEIN //改变前置
+				*pretimeout = TIMEIN //change the pre-conditions
 				v.sessionPM.rxMsgCount = 0
 				log.Info(modulName, "pre finish:", "")
 				v.sessionPM.sessionState++
@@ -295,7 +295,7 @@ func (v *Verifier) followerProcess() {
 			go v.sendTxToLeader(txs)
 
 		case leaderTx := <-v.followerTxRecvCh:
-			//验证交易
+			//validate the transactions
 			invalidTx := make([]uint16, 0)
 			for k, tx := range leaderTx {
 				// If the transaction fails basic validation, discard it
