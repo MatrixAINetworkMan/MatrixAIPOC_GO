@@ -112,7 +112,7 @@ func (v *Verifier) waitForScheduler() {
 			if v.nodeState == nodeBusy {
 				log.Info(modulName, "ENTER VERIFIER", blockNum)
 
-				//通过nodelist和nodeid计算出当前验证者是leader还是follower
+				//Figure out whether the current validator is Leader or Follower, based on nodelist and nodeid
 				v.electionLeader(v.verifierList, blockNum)
 				log.Info(modulName, "verifierRole", v.role)
 				switch v.role {
