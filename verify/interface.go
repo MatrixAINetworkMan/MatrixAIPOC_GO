@@ -46,7 +46,7 @@ func mergeNodeInfo(nodeMap map[string]*types.ElectionTxPayLoadInfo, nodeList []e
 
 	for _, nodeInfo := range nodeList {
 		if _, ok := nodeMap[nodeInfo.ID]; ok {
-			// 已存在，说明节点有新的参选退选操作，以新操作为准
+			// already exists, indicating there are new elections/exits from elections. Subject to new actions
 			continue
 		} else {
 			nodeMap[nodeInfo.ID] = newPayLoadInfo(&nodeInfo, electType)
