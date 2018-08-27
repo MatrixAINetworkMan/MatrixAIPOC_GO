@@ -1,18 +1,18 @@
-// Copyright 2015 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2018 The MATRIX Authors 
+// This file is part of the MATRIX library. 
+// 
+// The MATRIX library is free software: you can redistribute it and/or modify 
+// it under the terms of the GNU Lesser General Public License as published by 
+// the Free Software Foundation, either version 3 of the License, or 
+// (at your option) any later version. 
+// 
+// The MATRIX library is distributed in the hope that it will be useful, 
+// but WITHOUT ANY WARRANTY; without even the implied warranty of 
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the 
+// GNU Lesser General Public License for more details. 
+// 
+// You should have received a copy of the GNU Lesser General Public License 
+// along with the MATRIX library. If not, see <http://www.gnu.org/licenses/>. 
 
 package miner
 
@@ -34,11 +34,9 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
-	//"github.com/ethereum/go-ethereum/election"
 	"github.com/ethereum/go-ethereum/params"
 	"gopkg.in/fatih/set.v0"
-	//"strconv"
-	"github.com/ethereum/go-ethereum/election"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -61,12 +59,6 @@ type Agent interface {
 	Stop()
 	Start()
 	GetHashRate() int64
-}
-
-//struct for broadcast block
-type BroadcastInfo struct  {
-	NodeList	election.NodeList
-	BlockNum 	uint64
 }
 
 // Work is the workers current environment and holds
@@ -122,7 +114,6 @@ type worker struct {
 	chainDb ethdb.Database
 
 	coinbase common.Address
-
 	extra    []byte
 
 	currentMu sync.Mutex
@@ -140,13 +131,9 @@ type worker struct {
 	// atomic status counters
 	mining int32
 	atWork int32
-
-	//chan fro receive broadcast info
-	broadcastCh		<-chan *BroadcastInfo
-	cache			*broadcastCache
 }
 
-func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux, broadcastCh <-chan *BroadcastInfo) *worker {
+func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker {
 	worker := &worker{
 		config:         config,
 		engine:         engine,
@@ -163,10 +150,7 @@ func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase com
 		coinbase:       coinbase,
 		agents:         make(map[Agent]struct{}),
 		unconfirmed:    newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
-		broadcastCh:	broadcastCh,
-		cache:			newBroadCastCache(),
 	}
-
 	// Subscribe NewTxsEvent for tx pool
 	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
 	// Subscribe events for blockchain
@@ -314,8 +298,8 @@ func (self *worker) update() {
 
 func (self *worker) wait() {
 	for {
-		select {
-		case result := <- self.recv:
+		mustCommitNewWork := true
+		for result := range self.recv {
 			atomic.AddInt32(&self.atWork, -1)
 
 			if result == nil {
@@ -339,10 +323,10 @@ func (self *worker) wait() {
 				log.Error("Failed writing block to chain", "err", err)
 				continue
 			}
-
-			if err != nil {
-				log.Error("Failed writing ele list to chain", "err", err)
-				continue
+			// check if canon block and write transactions
+			if stat == core.CanonStatTy {
+				// implicit by posting ChainHeadEvent
+				mustCommitNewWork = false
 			}
 			// Broadcast the block and announce chain insertion event
 			self.mux.Post(core.NewMinedBlockEvent{Block: block})
@@ -359,8 +343,9 @@ func (self *worker) wait() {
 			// Insert the block into the set of pending ones to wait for confirmations
 			self.unconfirmed.Insert(block.NumberU64(), block.Hash())
 
-		case info := <- self.broadcastCh:
-			self.cache.update(info)
+			if mustCommitNewWork {
+				self.commitNewWork()
+			}
 		}
 	}
 }
@@ -377,7 +362,7 @@ func (self *worker) push(work *Work) {
 		}
 	}
 }
-
+//lcq todo
 // makeCurrent creates a new environment for the current cycle.
 func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	state, err := self.chain.StateAt(parent.Root())
@@ -386,7 +371,7 @@ func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error
 	}
 	work := &Work{
 		config:    self.config,
-		signer:    types.NewEIP155Signer(self.config.ChainID),
+		signer:    types.NewEIP155Signer(self.config.ChainId),
 		state:     state,
 		ancestors: set.New(),
 		family:    set.New(),
@@ -440,16 +425,6 @@ func (self *worker) commitNewWork() {
 		Extra:      self.extra,
 		Time:       big.NewInt(tstamp),
 	}
-
-	// current block number is a broadcast block, add broadcast block with main node list info
-	if header.Number.Uint64()%params.BroadcastInterval == 0 {
-		self.cache.writeCacheToHeader(header)
-		log.Info("worker log: after write broadcast info into block", "minerList", header.MinerList)
-		log.Info("worker log: after write broadcast info into block", "committeeList", header.CommitteeList)
-		log.Info("worker log: after write broadcast info into block", "BothList", header.Both)
-		log.Info("worker log: after write broadcast info into block", "offlineList", header.OfflineList)
-	}
-
 	// Only set the coinbase if we are mining (avoid spurious block rewards)
 	if atomic.LoadInt32(&self.mining) == 1 {
 		header.Coinbase = self.coinbase
@@ -482,13 +457,18 @@ func (self *worker) commitNewWork() {
 	if self.config.DAOForkSupport && self.config.DAOForkBlock != nil && self.config.DAOForkBlock.Cmp(header.Number) == 0 {
 		misc.ApplyDAOHardFork(work.state)
 	}
-	pending, err := self.eth.TxPool().Pending()
-	if err != nil {
-		log.Error("Failed to fetch pending transactions", "err", err)
-		return
-	}
-	txs := types.NewTransactionsByPriceAndNonce(self.current.signer, pending)
-	work.commitTransactions(self.mux, txs, self.chain, self.coinbase)
+	//pending, err := self.eth.TxPool().Pending()
+	//if err != nil {
+	//	log.Error("Failed to fetch pending transactions", "err", err)
+	//	return
+	//}
+	//txs := types.NewTransactionsByPriceAndNonce(self.current.signer, pending)
+	//listN := work.commitTransactions(self.mux, txs, self.chain, self.coinbase)
+	//log.Info("====hezi=====","processTransactions listN",listN)
+
+	txpool := self.eth.TxPool()
+	listN := work.processTransactions(self.mux, txpool, self.chain, self.coinbase)
+	log.Info("====hezi=====","processTransactions listN",listN)
 
 	// compute uncles for the new block.
 	var (
@@ -554,7 +534,7 @@ func (self *worker) updateSnapshot() {
 	self.snapshotState = self.current.state.Copy()
 }
 
-func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsByPriceAndNonce, bc *core.BlockChain, coinbase common.Address) {
+func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsByPriceAndNonce, bc *core.BlockChain, coinbase common.Address) (listN []uint32) {
 	if env.gasPool == nil {
 		env.gasPool = new(core.GasPool).AddGas(env.header.GasLimit)
 	}
@@ -607,6 +587,11 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 
 		case nil:
 			// Everything ok, collect the logs and shift in the next transaction from the same account
+			//==========hezi===================
+			if tx.N != nil{
+				listN = append(listN,tx.N[0])
+			}
+			//==================================
 			coalescedLogs = append(coalescedLogs, logs...)
 			env.tcount++
 			txs.Shift()
@@ -637,6 +622,7 @@ func (env *Work) commitTransactions(mux *event.TypeMux, txs *types.TransactionsB
 			}
 		}(cpy, env.tcount)
 	}
+	return listN
 }
 
 func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) {
@@ -651,4 +637,67 @@ func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, c
 	env.receipts = append(env.receipts, receipt)
 
 	return nil, receipt.Logs
+}
+//==============================================================================//
+//Leader
+func (self *Work) processTransactions(mux *event.TypeMux, tp *core.TxPool, bc *core.BlockChain, coinbase common.Address) []uint32{
+	pending, err :=  tp.Pending()
+	if err != nil {
+		log.Error("Failed to fetch pending transactions", "err", err)
+		return nil
+	}
+	txs := types.NewTransactionsByPriceAndNonce(self.signer, pending)
+	return self.commitTransactions(mux, txs, bc, coinbase)
+}
+//Broadcast
+func (self *Work) processBroadcastTransactions(mux *event.TypeMux, tp core.TxPool, bc *core.BlockChain) {
+	mapTxs := tp.GetAllSpecialTxs()
+	for _,txs := range mapTxs{
+		for _,tx := range txs{
+			self.commitTransaction(tx,bc,common.Address{},nil)
+		}
+	}
+	return
+}
+//hezi
+func (env *Work) ConsensusTransactions(mux *event.TypeMux, txs []*types.Transaction, bc *core.BlockChain) error {
+	if env.gasPool == nil {
+		env.gasPool = new(core.GasPool).AddGas(env.header.GasLimit)
+	}
+	var coalescedLogs []*types.Log
+	for _,tx := range txs{
+		// If we don't have enough gas for any further transactions then we're done
+		if env.gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
+			return errors.New("Not enough gas for further transactions")
+		}
+		// Start executing the transaction
+		env.state.Prepare(tx.Hash(), common.Hash{}, env.tcount)
+		err, logs := env.commitTransaction(tx, bc, common.Address{}, env.gasPool)
+		if err == nil{
+			env.tcount++
+			coalescedLogs = append(coalescedLogs, logs...)
+		}else{
+			return err
+		}
+	}
+	if len(coalescedLogs) > 0 || env.tcount > 0 {
+		// make a copy, the state caches the logs and these logs get "upgraded" from pending to mined
+		// logs by filling in the block hash when the block was mined by the local miner. This can
+		// cause a race condition if a log was "upgraded" before the PendingLogsEvent is processed.
+		cpy := make([]*types.Log, len(coalescedLogs))
+		for i, l := range coalescedLogs {
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		go func(logs []*types.Log, tcount int) {
+			if len(logs) > 0 {
+				mux.Post(core.PendingLogsEvent{Logs: logs})
+			}
+			if tcount > 0 {
+				mux.Post(core.PendingStateEvent{})
+			}
+		}(cpy, env.tcount)
+	}
+	return nil
 }
