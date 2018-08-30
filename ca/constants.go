@@ -35,10 +35,10 @@ const (
 )
 
 const (
-	BroadcastInterval     = 100 //广播周期
-	ReelectionInterval    = 300 //换届周期
-	VerifyNetChangeUpTime = 40  //验证者网络切换时间点(提前量)
-	MinerNetChangeUpTime  = 30  //矿工网络切换时间点(提前量)
+	BroadcastInterval     = 100 //broadcast interval
+	ReelectionInterval    = 300 //re-election interval
+	VerifyNetChangeUpTime = 40  //validator network change time (upfront time)
+	MinerNetChangeUpTime  = 30  //miner network change time (upfront time)
 )
 
 type TopologyNodeInfo struct {
