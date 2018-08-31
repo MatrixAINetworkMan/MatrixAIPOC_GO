@@ -1,3 +1,16 @@
+# MATRIX AI NETWORK
+
+## WHAT IS MATRIX?
+
+The invention of Bitcoin in 2008 symbolized the advent of cryptocurrency. The succeeding years witnessed a dramatic growth in blockchain technology. The introduction of Ethereum paved the way for supporting complex business behaviors with cryptocurrencies. The overall momentum of development, however, is now facing a series of key challenges.
+
+Designed to be the new generation blockchain, MATRIX leverages the latest AI techniques to revolutionize the landscape of cryptocurrency. MATRIX differentiates itself from previous blockchains by offering breakthrough technologies in building AI-enabled autonomous and self-optimizing blockchain networks, which feature multi-chain collaboration and decoupling of data and control blocks.
+
+
+## :lock: Warnings
+
+MATRIX is a work-in-progress and in POC stage. Please use at your own risk.
+
 ## Introduction
 
 This is considered as a POC of Matrix in the form of golang implementation based on the Ethereum protocol.
