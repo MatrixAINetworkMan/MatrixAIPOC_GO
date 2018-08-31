@@ -6,6 +6,8 @@ The invention of Bitcoin in 2008 symbolized the advent of cryptocurrency. The su
 
 Designed to be the new generation blockchain, MATRIX leverages the latest AI techniques to revolutionize the landscape of cryptocurrency. MATRIX differentiates itself from previous blockchains by offering breakthrough technologies in building AI-enabled autonomous and self-optimizing blockchain networks, which feature multi-chain collaboration and decoupling of data and control blocks.
 
+To learn more about MATRIX, please read the [Technical White Paper](https://github.com/MatrixAINetwork/WhitePaper/blob/master/MATRIXTechnicalWhitePaper.pdf) or [Business White Paper](https://github.com/MatrixAINetwork/WhitePaper/blob/master/MATRIXBusinessWhitePaper.pdf).
+
 
 ## :lock: Warnings
 
