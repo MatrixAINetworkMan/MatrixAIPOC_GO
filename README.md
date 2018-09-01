@@ -1,6 +1,9 @@
 # MATRIX AI NETWORK
+##### ![](https://i.imgur.com/zEhzTmQ.png)
 
-## WHAT IS MATRIX?
+
+## WHAT IS MATRIX?                                                                       
+
 
 The invention of Bitcoin in 2008 symbolized the advent of cryptocurrency. The succeeding years witnessed a dramatic growth in blockchain technology. The introduction of Ethereum paved the way for supporting complex business behaviors with cryptocurrencies. The overall momentum of development, however, is now facing a series of key challenges.
 
