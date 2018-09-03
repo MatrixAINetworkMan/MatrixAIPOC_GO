@@ -23,7 +23,7 @@ Instances of abusive, harassing, or otherwise unacceptable behavior may be repor
 
 If you wish to contact specific maintainers directly, the following have made themselves available for conduct issues:
 
-- Allen Hao (Allen at MATRIX)
-- Ascii Shang (Ascii at MATRIX)
+- Allen Hao (Allen at MATRIX, linhao@matrix.io)
+- Ascii Shang (Ascii at MATRIX, shunshang@matrix.io)
 
 This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/), version 1.3.0, available at [https://www.contributor-covenant.org/version/1/3/0/](https://www.contributor-covenant.org/version/1/3/0/)
