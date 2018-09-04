@@ -16,9 +16,8 @@ To learn more about MATRIX, please read the [Technical White Paper](https://gith
 
 MATRIX is a work-in-progress and in POC stage. Please use at your own risk.
 
-## Introduction
 
-This is considered as a POC of Matrix in the form of golang implementation based on the Ethereum protocol.
+This is considered as a POC of MATRIX in the form of golang implementation based on the Ethereum protocol.
 
 ### In this POC version (v0.0.1), MATRIX made such improvements:
 
