@@ -59,7 +59,7 @@ func (bc *BroadCast) loop() {
 	}
 }
 
-//YY 广播交易的接口
+//YY Interface of Broadcast Transactions
 func (bc *BroadCast) sendBroadCastTransaction(t string, h *big.Int, data []byte) error {
 	if h.Cmp(big.NewInt(100)) < 0 {
 		log.Info("===Send BroadCastTx===", "block height less than 100")
